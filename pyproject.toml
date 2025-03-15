@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "qurveros"
+version = "1.0.0"
+
+description = "SCQC and BARQ implementation based on JAX."
+
+readme = "README.md"
+
+license = "BSD-3-Clause-Clear"
+license-files = ["LICENSE.txt"]
+
+requires-python = ">=3.10"
+
+authors = [
+    {name = "Evangelos Piliouras", email = "piliouras@vt.edu"}
+]
+
+keywords = ["quantum control", 
+            "robust quantum control", 
+            "space curve",
+            "scqc", 
+            "barq", 
+            "noise", 
+            "quantum information"]
+
+classifiers = [
+ "Topic :: Scientific/Engineering :: Physics",
+ "Intended Audience :: Science/Research"
+]
+
+dependencies = [
+'jax',
+'qutip>=5',
+'numpy',
+'scipy',
+'pandas',
+'optax',
+'matplotlib'
+]
+
+[project.optional-dependencies]
+examples = [
+  'jupyter',
+  ]
+
+results = [
+    'filter_functions',
+    'jupyter',
+]
+
+[tool.hatch.build.targets.sdist]
+
+exclude = [
+  "docs",
+  "examples",
+  "results",
+]
+
+[tool.hatch.build.targets.wheel]
+exclude = [
+  "docs",
+  "examples",
+  "results",
+]
+
+[project.urls]
+homepage = "https://github.com/evpiliouras/qurveros"
+repository = "https://github.com/evpiliouras/qurveros"
+issues = "https://github.com/evpiliouras/qurveros/ISSUES.md"
