@@ -1,433 +1,350 @@
 """
-This module contains the class definitions of Spacecurve, BezierCurve and
-RobustnessProperties.
+This module extends the functionality of the SpaceCurve class by providing
+optimization methods for the auxiliary parameters.
+The BarqCurve class is also defined in this module.
 """
 
 import jax
 import jax.numpy as jnp
-import functools
+import numpy
+import optax
+import pandas as pd
 
+from qurveros import beziertools, barqtools, spacecurve
+
+from qurveros.misctools import progbar_range
 from qurveros.settings import settings
-from qurveros import controltools, frametools, beziertools, plottools
 
 
-class SpaceCurve:
+class OptimizableSpaceCurve(spacecurve.SpaceCurve):
 
     """
-    Implements the SCQC to quantum evolution mapping.
-
-    Each curve contains a strictly one traversal parameter (if it's unit-speed,
-    that parameter corresponds to the time variable of the quantum evolution)
-    and a set of auxiliary parameters that control its shape.
+    Extends the SpaceCurve class to provide optimization over the
+    auxiliary parameters.
 
     Attributes:
-
-        frenet_dict (dict): The frenet dictionary (see frametools.py).
-        The entries of the frenet_dict are augmented with global curve
-        elements.
-        interval (list): The endpoints of the traversal parameter interval.
-        params: The auxiliary parameters of the curve.
-        control_dict (dict): The control dictionary (see controltools.py)
-        robustness_prop (RobustnessProperties): Contains the robustness
-        properties of the curve.
+        opt_loss: The optimization loss function created using the
+                  prepare_optimization_loss method.
+        params_history: The parameters obtained from each optimization step.
+        loss_grad: The gradient of the loss function.
 
     Methods:
-
-        evaluate_frenet_dict: Calculates the frenet dictionary
-        at a given interval.
-        evaluate_robustness_properties: Calculates the robustness properties
-        of the curve.
-        get_gate_fidelity: Computes the average gate fidelity based on the
-        adjoint representation of SCQC.
-        calculate_control_dict: Sets the control dictionary
-        depending on the control mode.
-        plot_position: Plots the position vector of the curve.
-        plot_tantrix: Plots the normalized tangent vector of the curve.
-        plot_fields: Plots the control fields depending on the plot mode.
-        save_control_dict: Saves the control dictionary in a csv file.
+        prepare_optimization_loss: Creates the optimization loss based on
+        the provided loss functions and their associated weights.
+        optimize: Optimizes the curve's auxiliary parameters.
+        update_params_from_opt_history: Updates the curve's parameters based
+        on a chosen optimization step.
 
     Note:
-        When an instance is indexed, a dictionary is returned with entries:
-        'curve', 'frame', 'curvature', 'torsion', 'deriv_array', 'length'.
+        When an instance is indexed with a string, optimization information
+        is returned. See the optimize method.
     """
 
     def __init__(self, *, curve, order, interval, params=None,
                  deriv_array_fun=None):
 
+        self.opt_loss = None
+        self.params_history = None
+        self.loss_grad = lambda params: None
+
+        super().__init__(curve=curve,
+                         order=order,
+                         interval=interval,
+                         params=params,
+                         deriv_array_fun=deriv_array_fun)
+
+    def initialize_parameters(self, init_params=None):
+
         """
-        Initializes a spacecurve instance with the desired curve.
-        In principle, either a curve or the tangent of a curve can be used
-        to describe the mapping. The 'order' argument indicates that choice.
+        Initializes the parameters for the optimization.
+        """
+
+        if init_params is not None:
+            self.set_params(init_params)
+
+    def prepare_optimization_loss(self, *loss_list, interval=None):
+
+        """
+        Creates the optimization loss based on a loss list.
 
         Args:
-            curve (list or array): A three-element list arranged as
-                [x,y,z] which correspond to the components of the curve.
-            order (int): The order of the derivative that the curve argument
-                corresponds to.
-                order == 0 -> Position vector
-                order == 1 -> Tangent
-            interval (list): The closed interval of the curve parameter.
-            params: The auxiliary parameters of the curve.
-            deriv_array_fun (function): In case where the analytic derivatives
-            are pre-calculated and are given in a function that returns an
-            array of the form number_of_derivatives x 3, the automatic
-            differentiation is sidestepped in favor of the function.
-            }
-
-        Raises:
-            RuntimeError: Raised when not sufficient information is provided
-            for the frenet dictionary to be calculated.
-            AttributeError: Raised when an attribute is referenced before
-            the corresponding quantity is calculated.
+            loss_list(lists): The argument is a series of lists of the form
+                [loss_function, weight]. The total loss is constructed as a
+                linear combination of the function values multiplied by
+                the respective weights.
+            interval (list): The closed interval for the curve parameter where
+            optimization takes place. The default value corresponds to the
+            interval provided upon instantiation.
         """
 
-        self.frenet_dict = None
-        self.interval = interval
-        self.params = params
-        self.control_dict = None
-        self.robustness_props = None
+        if interval is None:
+            interval = self.interval
 
-        # Ensure correct types for frenet_dict calculations.
-        if curve is not None:
-            def curve_fun(x, params):
-                return 1.0*jnp.array(curve(x, params)).flatten()
-
-        if deriv_array_fun is None:
-            if curve is None:
-                raise RuntimeError('Either a curve or a deriv_array function '
-                                   'must be provided.')
-
-            deriv_array_fun = frametools.make_deriv_array_fun(curve_fun,
-                                                              order)
-        else:
-            if curve is None and order == 0:
-                raise RuntimeError('The position vector is not defined.')
-
-        if order > 0:
-            def curve_fun(x, params):
-                return 0.
+        x_values = jnp.linspace(*interval, settings.options['OPT_POINTS'])
 
         @jax.jit
-        @functools.partial(jax.vmap, in_axes=(0, None))
-        def frenet_dict_fun(x, params):
+        def opt_loss(params):
 
-            deriv_array = deriv_array_fun(x, params)
+            frenet_dict = self._frenet_dict_fun(x_values, params)
 
-            frenet_dict = frametools.calculate_frenet_dict(deriv_array)
+            loss = 0.
+            for loss_fun, weight in loss_list:
+                loss = loss + weight * loss_fun(frenet_dict)
 
-            frenet_dict['x_values'] = x
-            frenet_dict['params'] = params
+            return loss
 
-            frenet_dict['curve'] = curve_fun(x, params)
+        self.opt_loss = opt_loss
+        self.loss_grad = jax.jit(jax.grad(self.opt_loss))
 
-            return frenet_dict
-
-        self._frenet_dict_fun = frenet_dict_fun
-
-    def set_params(self, params):
+    def optimize(self, optimizer=None, max_iter=1000):
 
         """
-        Sets the default parameters of the curve.
-        The associated elements are set to None so that the geometric
-        quantities, the robustness properties and the control fields are
-        evaluated for the new set of auxiliary parameters.
-        """
-
-        self.params = params
-
-        self.frenet_dict = None
-        self.control_dict = None
-        self.robustness_props = None
-
-    def get_params(self):
-        return self.params
-
-    def evaluate_frenet_dict(self, n_points=None):
-
-        """
-        Evaluates the frenet dictionary in a specified number of points.
-
-        The frenet dictionary is augmented with:
-            'x_values' : The values of x.
-            'params' : The parameters for each value of x.
-            'curve': The position vector of the curve.
-            'length': The (cumulative) length of the curve.
+        Optimizes the curve's auxiliary parameters using Optax.
+        The parameters are updated based on the last iteration
+        of the optimizer. The params_history attribute is also set.
 
         Args:
-            n_points (int): The number of points where the frenet dictionary
-            is evaluated at the given interval. The default value is drawn
-            from the settings.options['CURVE_POINTS'].
+            optimizer (optax optimizer): The optimizer instance from Optax.
+            max_iter (int): The maximum number of iterations.
+
+        Raises: A RuntimeError exception is raised if the parameters
+        are not set.
+
+        Notes:
+        (1) If an optimizer is not supplied, a simple gradient descent
+            is implemented with learning_rate = 0.01.
+
+        (2) If string-based indexing is used, optimization information
+            is obtained at the optimization step which corresponds to the
+            integer value of the string or the respective slice.
         """
 
-        if n_points is None:
-            n_points = settings.options['CURVE_POINTS']
+        if optimizer is None:
+            optimizer = optax.scale(-0.01)
 
-        x_values = jnp.linspace(*self.interval,  n_points)
+        @jax.jit
+        def step(params, opt_state):
 
-        frenet_dict = self._frenet_dict_fun(x_values, self.params)
+            grads = self.loss_grad(params)
 
-        if len(frenet_dict['curve'].shape) < 2:
+            updates, opt_state = optimizer.update(grads, opt_state, params)
 
-            print('The curve will be constructed using the tangent vector.')
-            curve = frametools.calculate_curve_from_tantrix(frenet_dict)
-            frenet_dict['curve'] = jnp.array(curve)
+            params = optax.apply_updates(params, updates)
 
-        speed_int = frametools.calculate_cumulative_length(frenet_dict)
-        frenet_dict['length'] = speed_int
+            return params, opt_state
 
-        self.frenet_dict = frenet_dict
+        params = self.params
 
-    def get_frenet_dict(self):
-        return self.frenet_dict
+        if params is None:
+            raise RuntimeError(
+                'The parameters are not set.'
+                ' Use the .initialize_parameters() for initialization.')
+
+        opt_state = optimizer.init(params)
+
+        params_history = []
+
+        for _ in progbar_range(max_iter, title='Optimizing parameters'):
+
+            params_history.append(params)
+
+            params, opt_state = step(params, opt_state)
+
+        params_history.append(params)
+        self.params_history = params_history
+
+        self.set_params(params_history[-1])
+
+    def get_params_history(self):
+        return self.params_history
 
     def __getitem__(self, index):
 
-        dict_for_getitem = {}
+        if isinstance(index, str):
 
-        if self.frenet_dict is None:
-            return dict_for_getitem
+            if ':' not in index:
+                index = int(index)
+                param_value = self.params_history[index]
 
-        for key in ['curve', 'frame', 'curvature', 'torsion',
-                    'deriv_array', 'length']:
-            dict_for_getitem[key] = self.frenet_dict[key][index]
+                return {
+                    'param_value': param_value,
+                    'loss_value': self.opt_loss(param_value),
+                    'loss_grad_value': self.loss_grad(param_value)}
 
-        return dict_for_getitem
+            index = slice(*map(int, index.split(':')))
+            param_value = jnp.array(self.params_history[index])
+            return {
+                'param_value': param_value,
+                'loss_value': jax.vmap(self.opt_loss)(param_value),
+                'loss_grad_value': jax.vmap(self.loss_grad)(param_value)}
 
-    def __len__(self):
-        return len(self.frenet_dict['x_values'])
+        return super().__getitem__(index)
 
-    def evaluate_robustness_properties(self):
-
-        """
-        Calculates and sets the robustness properties of the curve.
-        See the RobustnessProperties class definition for more details.
-
-        Raises:
-             AttributeError: An exception is raised when the frenet dictionary
-             is not initialized.
-        """
-
-        if self.frenet_dict is None:
-            raise AttributeError('Have you initialized the frenet dict?')
-
-        robustness_props = RobustnessProperties(self.frenet_dict)
-
-        self.robustness_props = robustness_props
-
-    def get_robustness_properties(self):
-
-        if self.robustness_props is None:
-            raise AttributeError(
-                'Have you evaluated the robustness properties?')
-
-        return self.robustness_props
-
-    def evaluate_control_dict(self, control_mode, n_points=None):
-
-        """
-        Sets the control_dict attribute. The control dictionary contains
-        the control fields that implement the curve to quantum evolution
-        mapping.
-
-        Args:
-            control_mode (str): The control type for the Hamiltonian
-            (see controltools.py for more information).
-
-            n_points (int): The number of points where the control dictionary
-            is evaluated at the given interval. The default value is drawn
-            from the settings.options['SIM_POINTS'].
-
-        Raises:
-             AttributeError: An exception is raised when the frenet dictionary
-             is not initialized.
-
-        Note:
-            The number of points used to calculate the curve can be different
-            from the number of points used for the simulation. It is highly
-            advised that the curve is sampled at a higher rate to capture all
-            the fields' details.
-        """
-
-        if self.frenet_dict is None:
-            raise AttributeError('Have you initialized the frenet dict?')
-
-        if n_points is None:
-            n_points = settings.options['SIM_POINTS']
-
-        self.control_dict = controltools.calculate_control_dict(
-            self.frenet_dict,
-            control_mode,
-            n_points=n_points)
-
-    def get_control_dict(self):
-
-        return self.control_dict
-
-    def get_gate_fidelity(self, adj_target):
-
-        """
-        Calculates the average gate fidelity defined in
-        "A simple formula for the average gate fidelity of a
-        quantum dynamical operation" by Michael A. Nielsen, equation (18),
-        based on the adjoint representation.
-        """
-
-        return frametools.calculate_adj_fidelity(
-            self.control_dict['adj_curve'],
-            adj_target)
-
-    def plot_position(self):
-
-        """
-        Plots the position vector of the curve.
-        """
-        if self.frenet_dict is None:
-            raise AttributeError('Have you initialized the frenet dict?')
-
-        self._plot_vector(self.frenet_dict['curve'])
-
-    def plot_tantrix(self):
-
-        """
-        Plots the (normalized) tangent vector of the curve.
-        """
-        if self.frenet_dict is None:
-            raise AttributeError('Have you initialized the frenet dict?')
-
-        self._plot_vector(self.frenet_dict['frame'][:, 0, :])
-
-    def _plot_vector(self, vector):
-
-        Tg = self.frenet_dict['length'][-1]
-
-        plottools.plot_curve(vector, self.frenet_dict['length']/Tg)
-
-    def plot_fields(self, plot_mode='full'):
-
-        """
-        Plots the control fields depending on the plot mode.
-
-        Raises:
-            AttributeError: An exception is raised when a control dictionary
-            is not set.
-        """
-        if self.control_dict is None:
-            raise AttributeError('Have you chosen a control mode first?')
-
-        plottools.plot_fields(self.control_dict, plot_mode)
-
-    def save_control_dict(self, filename):
-
-        """
-        Saves the control fields in a csv file with entries described in
-        the controltools.py module.
-        """
-
-        if self.control_dict is None:
-            raise AttributeError('Have you chosen a control mode first?')
-
-        controltools.save_control_dict(self.control_dict, filename)
+    def update_params_from_opt_history(self, opt_step=-1):
+        self.set_params(self.params_history[opt_step])
 
 
-class BezierCurve(SpaceCurve):
+class BarqCurve(OptimizableSpaceCurve):
 
     """
-    This class implements SCQC based on a Bezier curve, hence it
-    requires only the control points.
+    The BarqCurve implements the BARQ method that provides the optimal control
+    points for the Bezier curve based on a loss function.
+    See the paper for the description of the Point Configuration (PC) which
+    defines the PGF and the PRS. Their implementation can be found in
+    barqtools.py
 
-    The deriv_array_fun is passed as argument to the constructor since
-    the Bezier curves transfer the parameter differentiation to finite
-    differences in the control points.
+    Attributes:
+        n_free_points: The number of free points used in BARQ.
+        barq_fun: The map created with free_points, PGF and PRS to the Bezier
+        control points.
+
+    Methods:
+        initialize_parameters: Initializes the various parameters involved in
+        BARQ.
+        get_bezier_control_points: Returns the Bezier curve control points used
+        in BARQ.
+        save_bezier_control_points: Stores the control points in a csv file.
+        See the method implementation for details.
+
+    Notes:
+
+    The pgf_mod function is defined as:
+
+    def pgf_mod(pgf_params, input_points):
+        new_pgf_params = pgf_params.copy()
+        ...
+        return new_pgf_params
+
+    The pgf_params provide flexibility on the gate-fixing stage of the BARQ
+    method. The input points are the free points of the BARQ method.
+
+    The prs_fun function is defined as:
+
+    def prs_fun(prs_params, input_points):
+
+        return internal_points
+
+    At this step, the input points is an (6 + (n_free_points-2)) x 3 array.
+    The first 6 points correspond to the control points which participate
+    in the gate-fixing process and the rest are the free_points
+    (the first two are excluded since they were already included in the first
+    6 input points).
+
+    A prs_fun that simply allows the free_points to pass acts as:
+    prs_params, input_points -> input_points[6:, :].
     """
 
-    def __init__(self, points):
+    def __init__(self, *, adj_target, n_free_points,
+                 pgf_mod=None, prs_fun=None):
 
         """
-        Receives the control points for the construction of the Bezier curve.
+        Initializes the BARQ method.
 
         Args:
-            points (array): A 3 x M array of control points.
-
-        Raises:
-            ValueError: If the number of control points provided is not
-            sufficient.
+            adj_target (array): The adjoint representation of the target
+            operation.
+            n_free_points (int): The number of free points
+            for the BARQ method.
+            pgf_mod (function): A function that modifies the PGF parameters.
+            prs_fun (function): A function that enforces a particular structure
+            on the internal points of the curve.
         """
 
-        # Without the pre-calculation of the derivatives, we could use:
-        # super().__init__(curve=beziertools.bezier_curve_vec,
-        #                  order=0,
-        #                  interval=[0, 1],
-        #                  params=points)
+        self.n_free_points = n_free_points
 
-        if points.shape[0] <= settings.options['NUM_DERIVS']:
-            raise ValueError('More control points are required.'
-                             ' Check NUM_DERIVS value')
+        barq_fun = barqtools.make_barq_fun(adj_target, pgf_mod, prs_fun)
+        self.barq_fun = barq_fun
 
         bezier_deriv_array_fun = beziertools.make_bezier_deriv_array_fun()
 
-        # The current implementation of the bezier curve derivatives assumes
-        # a sufficient number of points so that the finite differences do not
-        # return an empty array.
+        def barq_derivs_fun(x, params):
 
-        super().__init__(curve=beziertools.bezier_curve_vec,
+            W = barq_fun(params)
+
+            return bezier_deriv_array_fun(x, W)
+
+        def barq_curve(x, params):
+
+            W = barq_fun(params)
+
+            return beziertools.bezier_curve_vec(x, W)
+
+        super().__init__(curve=barq_curve,
                          order=0,
                          interval=[0, 1],
-                         params=points,
-                         deriv_array_fun=bezier_deriv_array_fun)
+                         deriv_array_fun=barq_derivs_fun)
+def initialize_parameters(self, *, init_free_points=None,
+                         init_pgf_params=None,
+                         init_prs_params=None, seed=None):
+    params = {}
+
+    if seed is None:
+        seed = 0
+
+    rng = numpy.random.default_rng(seed)
+
+    if init_free_points is None:
+        init_free_points = rng.standard_normal((self.n_free_points, 3))
+        init_free_points = init_free_points/numpy.linalg.norm(init_free_points, axis=0)
+        init_free_points = jnp.array(init_free_points)
+    else:
+        # Only change: Add dtype conversion here
+        init_free_points = jnp.asarray(init_free_points, dtype=jnp.float32)
+        
+        if init_free_points.shape[0] != self.n_free_points:
+            raise ValueError('Inconsistent number of free points')
+
+    if init_pgf_params is None:
+        init_pgf_params = barqtools.get_default_pgf_params_dict()
+
+    if init_prs_params is None:
+        init_prs_params = {}
+
+    params['free_points'] = init_free_points
+    params['pgf_params'] = init_pgf_params
+    params['prs_params'] = init_prs_params
+
+    return super().initialize_parameters(params)
 
 
-class RobustnessProperties:
-
-    """
-    Calculates the robustness properties associated with a given curve.
-
-    When printed, robustness properties that appear as vectors are expressed
-    as the squared norm of that vector.
-    """
-
-    def __init__(self, frenet_dict):
-
-        self.frenet_dict = frenet_dict
-        self.calculate_properties()
-
-    def __repr__(self):
-
-        for rob_test, value in self.robustness_dict.items():
-
-            print_val = value**2
-
-            if rob_test == 'CFI':
-                print_val = value
-
-            print(f"|{rob_test:^25}: \t {jnp.sum(print_val):.4e}")
-
-        return ''
-
-    def calculate_properties(self):
+    def evaluate_control_dict(self, n_points=None):
 
         """
-        Calculates the robustness dictionary which contains all the robustness
-        properties associated with the curve.
+        Evaluates the control dictionary using the TTC choice.
         """
 
-        robustness_dict = {}
+        # If the pgf_mod fixes some parameters, they will not be automatically
+        # updated upon execution. The corner case is when the barq_angle
+        # is fixed, and the TTC used. That case must be handled with an
+        # additional update or by masking the respective gradient update.
 
-        Tg = self.frenet_dict['length'][-1]
+        super().evaluate_control_dict('TTC', n_points)
 
-        robustness_dict['closed_test'] = (self.frenet_dict['curve'][-1] -
-                                          self.frenet_dict['curve'][0])/Tg
+    def get_bezier_control_points(self):
 
-        robustness_dict['curve_area_test'] = \
-            frametools.calculate_curve_area(self.frenet_dict)
+        """
+        Returns the control points used in BARQ.
+        """
 
-        robustness_dict['tantrix_area_test'] = \
-            frametools.calculate_tantrix_area(self.frenet_dict)
+        return self.barq_fun(self.params)
 
-        robustness_dict['CFI'] = \
-            frametools.calculate_cfi_value(self.frenet_dict)
+    def save_bezier_control_points(self, filename):
 
-        self.robustness_dict = robustness_dict
+        """
+        Saves the control points of the associated Bezier curve.
+        The first row contains the value of the binormal angle and the rest
+        contain the control points used in BARQ.
+        """
 
-    def get_robustness_dict(self):
+        points = self.get_bezier_control_points()
+        barq_angle = self.params['pgf_params']['barq_angle']
 
-        return self.robustness_dict
+        # We add the first line to store the binormal angle for the TTC.
+
+        points = jnp.vstack([
+            [barq_angle, -1., -1.],
+            points
+        ])
+
+        df = pd.DataFrame(points)
+        df.to_csv(filename, index=False, float_format='%.12f')
