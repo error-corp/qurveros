@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy
 import optax
 import pandas as pd
-
+import warnings
 from qurveros import beziertools, barqtools, spacecurve
 
 from qurveros.misctools import progbar_range
@@ -275,56 +275,52 @@ class BarqCurve(OptimizableSpaceCurve):
                          deriv_array_fun=barq_derivs_fun)
 
     def initialize_parameters(self, *, init_free_points=None,
-                              init_pgf_params=None,
-                              init_prs_params=None, seed=None):
+                         init_pgf_params=None,
+                         init_prs_params=None, seed=None):
+    params = {}
 
-        """
-        Initializes the parameters for the BARQ method.
-        The parameters are passed to the curve as a dictionary with entries
-        containing the free points, the pgf parameters and the prs parameters.
+    if seed is None:
+        seed = 0
 
-        If no initial free points are provided, a total of n_free_points random
-        points are drawn and normalized to unit magnitude.
+    rng = numpy.random.default_rng(seed)
 
-        Raises:
-            ValueError: If the number of free points provided upon
-            instantiation do not agree with the dimensions of the initial
-            points.
-        """
+    if init_free_points is None:
+        init_free_points = rng.standard_normal((self.n_free_points, 3))
+        init_free_points = init_free_points / numpy.linalg.norm(init_free_points, axis=0)
+        init_free_points = jnp.array(init_free_points, dtype=jnp.float32)  # <-- Enforce float32
+    else:
+        if init_free_points.shape[0] != self.n_free_points:
+            raise ValueError('Inconsistent number of free points with provided initial free points.')
+        
+        # Convert integer inputs to float32
+        if jnp.issubdtype(init_free_points.dtype, jnp.integer):
+            warnings.warn("init_free_points contained integers. Converting to float32.")
+            init_free_points = init_free_points.astype(jnp.float32)
+        elif not jnp.issubdtype(init_free_points.dtype, jnp.floating):
+            init_free_points = init_free_points.astype(jnp.float32)  # Fallback for other types
 
-        params = {}
+    # Ensure pgf_params and prs_params use floating-point if they contain numeric values
+    if init_pgf_params is None:
+        init_pgf_params = barqtools.get_default_pgf_params_dict()
+    else:
+        init_pgf_params = {
+            k: v.astype(jnp.float32) if isinstance(v, jnp.ndarray) else v
+            for k, v in init_pgf_params.items()
+        }
 
-        if seed is None:
-            seed = 0
+    if init_prs_params is None:
+        init_prs_params = {}
+    else:
+        init_prs_params = {
+            k: (v.astype(jnp.float32) if isinstance(v, jnp.ndarray) else v)
+            for k, v in init_prs_params.items()
+        }
 
-        rng = numpy.random.default_rng(seed)
+    params['free_points'] = init_free_points
+    params['pgf_params'] = init_pgf_params
+    params['prs_params'] = init_prs_params
 
-        if init_free_points is None:
-
-            init_free_points = rng.standard_normal((self.n_free_points, 3))
-            init_free_points = \
-                init_free_points/numpy.linalg.norm(init_free_points, axis=0)
-
-            init_free_points = jnp.array(init_free_points)
-
-        else:
-            if init_free_points.shape[0] != self.n_free_points:
-                raise ValueError('Inconsistent number of free points with'
-                                 ' provided initial free points.')
-
-        if init_pgf_params is None:
-
-            init_pgf_params = barqtools.get_default_pgf_params_dict()
-
-        if init_prs_params is None:
-            init_prs_params = {}
-
-        params['free_points'] = init_free_points
-        params['pgf_params'] = init_pgf_params
-        params['prs_params'] = init_prs_params
-
-        return super().initialize_parameters(params)
-
+    return super().initialize_parameters(params)
     def evaluate_control_dict(self, n_points=None):
 
         """
