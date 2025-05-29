@@ -9,6 +9,8 @@ import jax.numpy as jnp
 import numpy
 import optax
 import pandas as pd
+import warnings
+import logging
 
 from qurveros import beziertools, barqtools, spacecurve
 
@@ -96,6 +98,76 @@ class OptimizableSpaceCurve(spacecurve.SpaceCurve):
         self.opt_loss = opt_loss
         self.loss_grad = jax.jit(jax.grad(self.opt_loss))
 
+    @jax.jit
+    def _is_params_valid(self, params):
+        """
+        Checks if parameters contain NaN or infinite values.
+        
+        Args:
+            params: Parameter tree to validate
+            
+        Returns:
+            bool: True if all parameters are finite, False otherwise
+        """
+        def is_finite_leaf(x):
+            return jnp.all(jnp.isfinite(x))
+        
+        # Check all leaves in the parameter tree
+        finite_flags = jax.tree_util.tree_map(is_finite_leaf, params)
+        
+        # All leaves must be finite
+        return jax.tree_util.tree_reduce(jnp.logical_and, finite_flags, True)
+
+    def _create_perturbed_params(self, base_params, magnitude, rng_key):
+        """
+        Creates perturbed parameters from valid base parameters.
+        
+        Args:
+            base_params: Valid parameter tree to perturb
+            magnitude: Magnitude of perturbation
+            rng_key: JAX random key
+            
+        Returns:
+            Perturbed parameter tree
+        """
+        def add_noise_to_leaf(leaf, key):
+            noise = jax.random.normal(key, leaf.shape) * magnitude
+            return leaf + noise
+        
+        # Generate keys for each leaf
+        treedef = jax.tree_util.tree_structure(base_params)
+        num_leaves = treedef.num_leaves
+        keys = jax.random.split(rng_key, num_leaves)
+        
+        # Apply noise to each leaf
+        perturbed_params = jax.tree_util.tree_map(
+            add_noise_to_leaf, base_params, 
+            jax.tree_util.tree_unflatten(treedef, keys)
+        )
+        
+        return perturbed_params
+
+    def _log_retry_attempt(self, iteration, retry_count, error_type):
+        """
+        Logs retry attempts based on verbosity settings.
+        
+        Args:
+            iteration: Current optimization iteration
+            retry_count: Number of retry attempt
+            error_type: Type of numerical error detected
+        """
+        verbosity = settings.options.get('OPTIMIZATION_VERBOSITY', 0)
+        
+        if verbosity >= 1:
+            message = (f"Numerical instability detected at iteration {iteration}. "
+                      f"Retry attempt {retry_count}: {error_type}")
+            warnings.warn(message, RuntimeWarning, stacklevel=4)
+            
+        if verbosity >= 2:
+            logger = logging.getLogger(__name__)
+            logger.debug(f"Optimization retry: iter={iteration}, "
+                        f"attempt={retry_count}, error={error_type}")
+
     def optimize(self, optimizer=None, max_iter=1000):
 
         """
@@ -103,12 +175,17 @@ class OptimizableSpaceCurve(spacecurve.SpaceCurve):
         The parameters are updated based on the last iteration
         of the optimizer. The params_history attribute is also set.
 
+        This method includes automatic handling of numerical instabilities
+        that may occur during optimization. When NaN or infinite values
+        are detected in the parameters, the optimizer will attempt to
+        recover by perturbing the last known valid parameters and retrying.
+
         Args:
             optimizer (optax optimizer): The optimizer instance from Optax.
             max_iter (int): The maximum number of iterations.
 
-        Raises: A RuntimeError exception is raised if the parameters
-        are not set.
+        Raises: 
+            RuntimeError: If the parameters are not set.
 
         Notes:
         (1) If an optimizer is not supplied, a simple gradient descent
@@ -117,8 +194,20 @@ class OptimizableSpaceCurve(spacecurve.SpaceCurve):
         (2) If string-based indexing is used, optimization information
             is obtained at the optimization step which corresponds to the
             integer value of the string or the respective slice.
+            
+        (3) Numerical stability is handled automatically using settings:
+            - MAX_OPTIMIZATION_RETRIES: Maximum retry attempts (default: 3)
+            - PERTURBATION_MAGNITUDE: Size of parameter perturbation (default: 1e-6)
+            - OPTIMIZATION_VERBOSITY: Logging level (default: 0)
+            - NUMERICAL_CHECK_FREQUENCY: Check frequency (default: 1)
         """
 
+        # Load numerical stability settings
+        max_retries = settings.options.get('MAX_OPTIMIZATION_RETRIES', 3)
+        perturbation_mag = settings.options.get('PERTURBATION_MAGNITUDE', 1e-6)
+        verbosity = settings.options.get('OPTIMIZATION_VERBOSITY', 0)
+        check_freq = settings.options.get('NUMERICAL_CHECK_FREQUENCY', 1)
+        
         if optimizer is None:
             optimizer = optax.scale(-0.01)
 
@@ -140,15 +229,96 @@ class OptimizableSpaceCurve(spacecurve.SpaceCurve):
                 'The parameters are not set.'
                 ' Use the .initialize_parameters() for initialization.')
 
-        opt_state = optimizer.init(params)
+        # Initialize numerical stability tracking
+        last_valid_params = params
+        last_valid_opt_state = optimizer.init(params)
+        rng_key = jax.random.PRNGKey(0)
+        
+        # Check initial parameters
+        if not self._is_params_valid(params):
+            raise RuntimeError(
+                'Initial parameters contain NaN or infinite values. '
+                'Please check parameter initialization.')
 
+        opt_state = optimizer.init(params)
         params_history = []
 
-        for _ in progbar_range(max_iter, title='Optimizing parameters'):
+        for iteration in progbar_range(max_iter, title='Optimizing parameters'):
 
             params_history.append(params)
 
-            params, opt_state = step(params, opt_state)
+            # Periodic numerical stability check
+            if iteration % check_freq == 0 and not self._is_params_valid(params):
+                
+                recovery_successful = False
+                
+                for retry in range(max_retries):
+                    self._log_retry_attempt(iteration, retry + 1, "NaN/Inf detected")
+                    
+                    # Perturb last valid parameters
+                    rng_key, subkey = jax.random.split(rng_key)
+                    params = self._create_perturbed_params(
+                        last_valid_params, perturbation_mag, subkey)
+                    opt_state = last_valid_opt_state
+                    
+                    # Check if perturbation resolved the issue
+                    if self._is_params_valid(params):
+                        recovery_successful = True
+                        if verbosity >= 1:
+                            warnings.warn(
+                                f"Successfully recovered from numerical instability "
+                                f"at iteration {iteration} after {retry + 1} attempts.",
+                                RuntimeWarning, stacklevel=2)
+                        break
+                
+                if not recovery_successful:
+                    # All retry attempts failed
+                    error_message = (
+                        f"Critical numerical instability at iteration {iteration}. "
+                        f"Failed to recover after {max_retries} attempts. "
+                        f"Optimization results may be unreliable. "
+                        f"Consider: (1) checking initial parameters, "
+                        f"(2) reducing learning rate, (3) using different optimizer, "
+                        f"(4) increasing PERTURBATION_MAGNITUDE in settings."
+                    )
+                    
+                    if verbosity >= 0:  # Always warn for critical failures
+                        warnings.warn(error_message, RuntimeWarning, stacklevel=2)
+                    
+                    # Continue with last valid parameters as fallback
+                    params = last_valid_params
+                    opt_state = last_valid_opt_state
+
+            # Perform optimization step
+            try:
+                new_params, new_opt_state = step(params, opt_state)
+                
+                # Validate the step result
+                if self._is_params_valid(new_params):
+                    # Successful step - update tracking variables
+                    params = new_params
+                    opt_state = new_opt_state
+                    last_valid_params = params
+                    last_valid_opt_state = opt_state
+                else:
+                    # Step produced invalid parameters - use recovery
+                    if verbosity >= 1:
+                        warnings.warn(
+                            f"Optimization step at iteration {iteration} "
+                            f"produced invalid parameters. Using last valid state.",
+                            RuntimeWarning, stacklevel=2)
+                    # Keep current valid parameters
+                    
+            except Exception as e:
+                # Optimization step failed completely
+                if verbosity >= 1:
+                    warnings.warn(
+                        f"Optimization step failed at iteration {iteration}: {e}. "
+                        f"Using last valid parameters.",
+                        RuntimeWarning, stacklevel=2)
+                # Keep current valid parameters
+                params = last_valid_params
+                opt_state = last_valid_opt_state
 
         params_history.append(params)
         self.params_history = params_history
