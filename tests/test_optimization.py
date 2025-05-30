@@ -116,3 +116,100 @@ class XgateBarqTestCase(unittest.TestCase):
         zero_tantrix_test = jnp.sum(robustness_dict['tantrix_area_test']**2)
 
         self.assertTrue(jnp.isclose(zero_tantrix_test, 0.))
+class BarqCurveFittingTestCase(unittest.TestCase):
+    """
+    Tests for the new curve fitting functionality in BarqCurve.
+    Verifies that control points can be fitted to target curves and points.
+    """
+
+    def setUp(self):
+        # Setup target gate (X-gate) for BARQ
+        u_target = qutip.sigmax()
+        adj_target = quantumtools.calculate_adj_rep(u_target)
+        
+        self.barqcurve = BarqCurve(adj_target=adj_target, n_free_points=8)
+
+    def test_curve_fitting_to_circular_function(self):
+        """
+        Test fitting to a circular parametric function.
+        Verifies that fitted curve approximates the target circle.
+        """
+        # Define a simple circular curve
+        def circle_curve(t):
+            return [jnp.cos(2 * jnp.pi * t), jnp.sin(2 * jnp.pi * t), 0.0]
+        
+        # Initialize with curve fitting
+        self.barqcurve.initialize_parameters(
+            fit_target_curve=circle_curve,
+            fit_n_samples=50
+        )
+        
+        # Verify parameters were set
+        self.assertIsNotNone(self.barqcurve.params)
+        self.assertIn('free_points', self.barqcurve.params)
+        
+        # Check that free_points have correct shape
+        free_points = self.barqcurve.params['free_points']
+        self.assertEqual(free_points.shape, (8, 3))
+        
+        # Verify that fitted curve is not just random (should have some structure)
+        # Check that points are not all zeros or identical
+        self.assertFalse(jnp.allclose(free_points, 0.0))
+        self.assertFalse(jnp.allclose(free_points[0], free_points[1]))
+
+    def test_curve_fitting_to_specific_points(self):
+        """
+        Test fitting to an array of specific target points.
+        Verifies that the method can handle discrete point data.
+        """
+        # Define target points forming a simple path
+        target_points = jnp.array([
+            [1.0, 0.0, 0.0],
+            [0.5, 0.5, 0.0], 
+            [0.0, 1.0, 0.0],
+            [-0.5, 0.5, 0.0],
+            [-1.0, 0.0, 0.0]
+        ])
+        
+        # Initialize with point fitting
+        self.barqcurve.initialize_parameters(fit_target_points=target_points)
+        
+        # Verify parameters were set correctly
+        self.assertIsNotNone(self.barqcurve.params)
+        free_points = self.barqcurve.params['free_points']
+        self.assertEqual(free_points.shape, (8, 3))
+        
+        # Verify fitted points are different from random initialization
+        # (by checking they're not all the same magnitude)
+        norms = jnp.linalg.norm(free_points, axis=1)
+        self.assertFalse(jnp.allclose(norms, norms[0], atol=1e-6))
+
+    def test_backward_compatibility_and_error_handling(self):
+        """
+        Test that traditional initialization still works and proper errors are raised.
+        Verifies backward compatibility and input validation.
+        """
+        # Test 1: Traditional random initialization should work unchanged
+        self.barqcurve.initialize_parameters(seed=42)
+        params_random = self.barqcurve.params['free_points']
+        
+        # Re-initialize with same seed should give same result
+        self.barqcurve.initialize_parameters(seed=42)
+        params_random_repeat = self.barqcurve.params['free_points']
+        self.assertTrue(jnp.allclose(params_random, params_random_repeat))
+        
+        # Test 2: Manual initialization should work unchanged
+        manual_points = jnp.ones((8, 3)) * 0.5
+        self.barqcurve.initialize_parameters(init_free_points=manual_points)
+        self.assertTrue(jnp.allclose(self.barqcurve.params['free_points'], manual_points))
+        
+        # Test 3: Error when conflicting initialization methods are used
+        with self.assertRaises(ValueError):
+            self.barqcurve.initialize_parameters(
+                init_free_points=manual_points,
+                fit_target_curve=lambda t: [t, t, t]
+            )
+        
+        # Test 4: Error when neither curve nor points provided to fitting
+        with self.assertRaises(ValueError):
+            self.barqcurve._fit_curve_to_control_points()

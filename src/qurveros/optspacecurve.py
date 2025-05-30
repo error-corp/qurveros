@@ -274,9 +274,116 @@ class BarqCurve(OptimizableSpaceCurve):
                          interval=[0, 1],
                          deriv_array_fun=barq_derivs_fun)
 
+    def _fit_curve_to_control_points(self, target_curve=None, target_points=None, 
+                                   n_samples=100):
+        """
+        Fits free control points to a target curve using least squares method.
+        
+        This method constructs a Bernstein matrix and uses pseudo-inverse to find
+        the control points that best approximate the target curve in the least
+        squares sense. Only the internal free points are fitted, while maintaining
+        the BARQ structure for gate-fixing points.
+        
+        Args:
+            target_curve (callable, optional): A function that takes parameter t 
+                in [0,1] and returns [x, y, z] coordinates.
+            target_points (array, optional): Array of target points with shape 
+                (n_points, 3).
+            n_samples (int): Number of parameter samples to use for fitting.
+                Default is 100.
+        
+        Returns:
+            jnp.array: Array of fitted free_points with shape (n_free_points, 3).
+            
+        Raises:
+            ValueError: If neither target_curve nor target_points is provided.
+            
+        Note:
+            The fitting process respects the BARQ structure where the first 2
+            free points are used in the gate-fixing process and only the internal
+            points (indices 2 to n_free_points) are truly free for curve fitting.
+        """
+        
+        if target_curve is None and target_points is None:
+            raise ValueError("Either target_curve or target_points must be provided")
+        
+        # 1. Generate target points
+        if target_curve is not None:
+            t_vals = jnp.linspace(0, 1, n_samples)
+            target_points = jnp.array([target_curve(float(t)) for t in t_vals])
+        else:
+            target_points = jnp.array(target_points)
+            n_samples = len(target_points)
+            t_vals = jnp.linspace(0, 1, n_samples)
+        
+        # 2. Estimate number of control points that BARQ will generate
+        # Based on BARQ structure: 2 boundary + 6 gate-fixing + (n_free_points-2) internal
+        n_total_control = self.n_free_points + 6
+        
+        # 3. Build Bernstein matrix using existing beziertools functions
+        B_matrix = []
+        for t in t_vals:
+            row = []
+            for i in range(n_total_control):
+                # Use existing bernstein_poly function
+                bernstein_val = beziertools.bernstein_poly(
+                    jnp.array([i]), n_total_control-1, float(t)
+                )[0]
+                row.append(float(bernstein_val))
+            B_matrix.append(row)
+        
+        B_matrix = jnp.array(B_matrix)  # Shape: (n_samples, n_total_control)
+        
+        # 4. Solve least squares system using pseudo-inverse
+        control_points_fitted = jnp.linalg.pinv(B_matrix) @ target_points
+        
+        # 5. Extract only the relevant points for free_points structure
+        # BARQ structure: [boundary_start, gate_fixing_points(6), internal_points, boundary_end]
+        # We want internal points that correspond to free_points[2:]
+        start_idx = 7  # After boundary_start + gate_fixing(6)
+        end_idx = start_idx + (self.n_free_points - 2)  # -2 for first two gate-fixing free points
+        
+        if end_idx > len(control_points_fitted):
+            # Fallback: use the last available points
+            fitted_internal_points = control_points_fitted[-max(1, self.n_free_points-2):]
+            if len(fitted_internal_points) < self.n_free_points - 2:
+                # Pad with normalized random points if needed
+                rng = numpy.random.default_rng(0)
+                additional_points = rng.standard_normal(
+                    (self.n_free_points - 2 - len(fitted_internal_points), 3)
+                )
+                additional_points = additional_points / numpy.linalg.norm(
+                    additional_points, axis=1, keepdims=True
+                )
+                fitted_internal_points = jnp.vstack([
+                    fitted_internal_points, 
+                    jnp.array(additional_points)
+                ])
+        else:
+            fitted_internal_points = control_points_fitted[start_idx:end_idx]
+        
+        # 6. Generate initial gate-fixing points (first 2 free_points)
+        # These will be processed by the gate-fixing algorithm
+        rng = numpy.random.default_rng(0)
+        gate_fixing_points = rng.standard_normal((2, 3))
+        gate_fixing_points = gate_fixing_points / numpy.linalg.norm(
+            gate_fixing_points, axis=1, keepdims=True
+        )
+        
+        # 7. Combine gate-fixing and fitted internal points
+        free_points = jnp.vstack([
+            jnp.array(gate_fixing_points),
+            fitted_internal_points[:self.n_free_points-2]  # Ensure correct size
+        ])
+        
+        return free_points
+
     def initialize_parameters(self, *, init_free_points=None,
                               init_pgf_params=None,
-                              init_prs_params=None, seed=None):
+                              init_prs_params=None, seed=None,
+                              fit_target_curve=None,
+                              fit_target_points=None,
+                              fit_n_samples=100):
 
         """
         Initializes the parameters for the BARQ method.
@@ -286,10 +393,47 @@ class BarqCurve(OptimizableSpaceCurve):
         If no initial free points are provided, a total of n_free_points random
         points are drawn and normalized to unit magnitude.
 
+        Args:
+            init_free_points (array, optional): Initial free points array with 
+                shape (n_free_points, 3). If provided, takes precedence over 
+                curve fitting parameters.
+            init_pgf_params (dict, optional): Initial PGF parameters dictionary.
+                If None, default values are used.
+            init_prs_params (dict, optional): Initial PRS parameters dictionary.
+                If None, empty dictionary is used.
+            seed (int, optional): Random seed for reproducible initialization.
+                Default is None.
+            fit_target_curve (callable, optional): Function that takes parameter t 
+                in [0,1] and returns [x, y, z] coordinates for curve fitting.
+                Cannot be used together with init_free_points.
+            fit_target_points (array, optional): Array of target points with shape 
+                (n_points, 3) for curve fitting. Cannot be used together with 
+                init_free_points.
+            fit_n_samples (int, optional): Number of parameter samples to use for 
+                curve fitting. Default is 100. Only used when fitting to a curve.
+
         Raises:
             ValueError: If the number of free points provided upon
-            instantiation do not agree with the dimensions of the initial
-            points.
+                instantiation do not agree with the dimensions of the initial
+                points, or if conflicting initialization methods are specified.
+                
+        Examples:
+            # Traditional random initialization
+            barq_curve.initialize_parameters(seed=42)
+            
+            # Fit to a circular curve
+            barq_curve.initialize_parameters(
+                fit_target_curve=lambda t: [jnp.cos(2*jnp.pi*t), 
+                                          jnp.sin(2*jnp.pi*t), 0]
+            )
+            
+            # Fit to specific points
+            points = jnp.array([[1,0,0], [0,1,0], [-1,0,0], [0,-1,0]])
+            barq_curve.initialize_parameters(fit_target_points=points)
+            
+            # Manual initialization (original behavior)
+            custom_points = jnp.array([[1,1,1], [2,2,2], ...])
+            barq_curve.initialize_parameters(init_free_points=custom_points)
         """
 
         params = {}
@@ -299,8 +443,28 @@ class BarqCurve(OptimizableSpaceCurve):
 
         rng = numpy.random.default_rng(seed)
 
-        if init_free_points is None:
+        # Check for conflicting initialization methods
+        curve_fitting_requested = (fit_target_curve is not None or 
+                                 fit_target_points is not None)
+        manual_points_provided = init_free_points is not None
+        
+        if curve_fitting_requested and manual_points_provided:
+            raise ValueError(
+                "Cannot use curve fitting (fit_target_curve/fit_target_points) "
+                "together with manual initialization (init_free_points). "
+                "Please specify only one initialization method."
+            )
 
+        # Curve fitting initialization
+        if curve_fitting_requested:
+            init_free_points = self._fit_curve_to_control_points(
+                target_curve=fit_target_curve,
+                target_points=fit_target_points,
+                n_samples=fit_n_samples
+            )
+
+        # Traditional random initialization (original behavior)
+        if init_free_points is None:
             init_free_points = rng.standard_normal((self.n_free_points, 3))
             init_free_points = \
                 init_free_points/numpy.linalg.norm(init_free_points, axis=0)
@@ -366,3 +530,4 @@ class BarqCurve(OptimizableSpaceCurve):
 
         df = pd.DataFrame(points)
         df.to_csv(filename, index=False, float_format='%.12f')
+        
