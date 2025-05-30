@@ -98,7 +98,6 @@ class OptimizableSpaceCurve(spacecurve.SpaceCurve):
         self.opt_loss = opt_loss
         self.loss_grad = jax.jit(jax.grad(self.opt_loss))
 
-    @jax.jit
     def _is_params_valid(self, params):
         """
         Checks if parameters contain NaN or infinite values.
