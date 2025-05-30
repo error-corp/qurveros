@@ -40,6 +40,11 @@ class Settings:
     options['MAX_POINTS'] = 12
     options['COUNTOUR_LEVELS'] = (-9, -8, -7, -6, -5)
 
+    # Numerical stability options for optimization
+    options['MAX_OPTIMIZATION_RETRIES'] = 3
+    options['PERTURBATION_MAGNITUDE'] = 1e-6
+    options['OPTIMIZATION_VERBOSITY'] = 0  # 0=silent, 1=warnings, 2=debug
+    options['NUMERICAL_CHECK_FREQUENCY'] = 1  # Check every N iterations
     # The number of derivatives used for the moving frame.
     # The value is chosen so that inflection points are appropriately handled.
     options['NUM_DERIVS'] = 5
