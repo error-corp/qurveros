@@ -312,16 +312,13 @@ class BarqCurve(OptimizableSpaceCurve):
                 raise ValueError('Inconsistent number of free points with'
                                  ' provided initial free points.')
 
-        if init_pgf_params is None:
-
-            init_pgf_params = barqtools.get_default_pgf_params_dict()
-
-        if init_prs_params is None:
-            init_prs_params = {}
-
-        params['free_points'] = init_free_points
-        params['pgf_params'] = init_pgf_params
-        params['prs_params'] = init_prs_params
+        # Set parameters (type conversion happens in parent's set_params)
+        
+        params.update({
+            'free_points': init_free_points,
+            'pgf_params': init_pgf_params or barqtools_get_default_pgf_params_dict(),
+            'prs_params': init_prs_params or {}
+        })
 
         return super().initialize_parameters(params)
 

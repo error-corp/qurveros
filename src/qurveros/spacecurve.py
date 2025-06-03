@@ -6,7 +6,8 @@ RobustnessProperties.
 import jax
 import jax.numpy as jnp
 import functools
-import re
+import numpy as np
+import warnings
 
 from qurveros.settings import settings
 from qurveros import controltools, frametools, beziertools, plottools
@@ -90,35 +91,6 @@ class SpaceCurve:
 
         # Ensure correct types for frenet_dict calculations.
         if curve is not None:
-            if isinstance(curve, str):
-                #Ensure characters are safe
-                if re.search(r'[^0-9A-Za-z_ \[\],\+\-\*\/\(\).]', curve):
-                    raise ValueError("Unsafe characters in curve expression")
-                
-                #Get params
-                raw_names = [m.group(1)
-                            for m in re.finditer(r'\b([A-Za-z_]\w*)\b', curve)]
-                #Find all of the math functions within jnp
-                safe_math = {
-                        name: getattr(jnp, name)
-                        for name in dir(jnp)
-                        if not name.startswith("_")
-                }
-                reserved = set(safe_math) | {'x', 'jnp'}
-                #Preserve first-seen order
-                param_names = [n for n in dict.fromkeys(raw_names) if n not in reserved]
-
-                #Build the source
-                src  = "def _f(x, params):\n"
-                if param_names:
-                    src += f"    {', '.join(param_names)} = params\n"
-                src += f"    return jnp.array({curve})"
-
-                #Create the exec
-                safe_globals = {"__builtins__": None, "jnp": jnp, **safe_math}
-                exec(src, safe_globals)
-                curve = safe_globals['_f']
-                    
             def curve_fun(x, params):
                 return 1.0*jnp.array(curve(x, params)).flatten()
 
@@ -163,7 +135,31 @@ class SpaceCurve:
         evaluated for the new set of auxiliary parameters.
         """
 
-        self.params = params
+        #Determine the correct float type based on JAX config
+        float_dtype= jnp.float64 if jax.config.jax_enable_x64 else jnp.float32
+        
+        def convert_value(v):
+            
+            """Helper function that recursively convert values to JAX-compatible floats"""
+            if isinstance(v,(jnp.ndarray,np.ndarray)): 
+                if not jnp.issubdtype(v.dtype,jnp.floating):
+                    warnings.warn(f"Converting array to {float_dtype}")
+                    return jnp.asarray(v,dtype=float_dtype)
+                return v
+            elif isinstance(v,(list,tuple)):
+                return jnp.asarray(v,dtype=float_dtype)
+            elif isinstance(v,(int,float)):
+                warnings.warn(f"Converting scalar{v} to {float_dtype}")
+                return jnp.array(v, dtype=float_dtype) 
+            elif isinstance(v,dict):
+                return {k:convert_value(v) for k,v in v.items()}
+            return v
+        
+        #Convert all parameters while preserving the original structure 
+        converted_params ={
+            k:convert_value(v) for k ,v in params.items()
+        }
+        self.params = converted_params
 
         self.frenet_dict = None
         self.control_dict = None
