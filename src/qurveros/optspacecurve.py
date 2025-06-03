@@ -275,14 +275,13 @@ class BarqCurve(OptimizableSpaceCurve):
                          deriv_array_fun=barq_derivs_fun)
 
     def _fit_curve_to_control_points(self, target_curve=None, target_points=None, 
-                                   n_samples=100):
+                                n_samples=100, track_losses=False):
         """
-        Fits free control points to a target curve using least squares method.
+        Fits free control points to a target curve using BARQ structure.
         
-        This method constructs a Bernstein matrix and uses pseudo-inverse to find
-        the control points that best approximate the target curve in the least
-        squares sense. Only the internal free points are fitted, while maintaining
-        the BARQ structure for gate-fixing points.
+        This method optimizes free_points that are then mapped through barq_fun
+        to generate proper BARQ control points. It respects the gate-fixing 
+        structure and PGF/PRS transformations.
         
         Args:
             target_curve (callable, optional): A function that takes parameter t 
@@ -297,85 +296,121 @@ class BarqCurve(OptimizableSpaceCurve):
             
         Raises:
             ValueError: If neither target_curve nor target_points is provided.
-            
-        Note:
-            The fitting process respects the BARQ structure where the first 2
-            free points are used in the gate-fixing process and only the internal
-            points (indices 2 to n_free_points) are truly free for curve fitting.
         """
         
         if target_curve is None and target_points is None:
             raise ValueError("Either target_curve or target_points must be provided")
         
-        # 1. Generate target points
+        # 1. Generate target points (outside JIT to avoid tracer issues)
+        t_vals = jnp.linspace(0, 1, n_samples)
+        
         if target_curve is not None:
-            t_vals = jnp.linspace(0, 1, n_samples)
-            target_points = jnp.array([target_curve(float(t)) for t in t_vals])
+            # Evaluate target curve at concrete values (outside JIT)
+            target_points = []
+            for i in range(n_samples):
+                t_val = float(t_vals[i])
+                try:
+                    point = target_curve(t_val)
+                    # Handle potential nan/inf values
+                    point = jnp.array(point)
+                    if jnp.any(jnp.isnan(point)) or jnp.any(jnp.isinf(point)):
+                        # Replace with zeros if invalid
+                        point = jnp.zeros(3)
+                    target_points.append(point)
+                except:
+                    # Fallback for any evaluation errors
+                    target_points.append(jnp.zeros(3))
+            target_points = jnp.array(target_points)
         else:
             target_points = jnp.array(target_points)
-            n_samples = len(target_points)
-            t_vals = jnp.linspace(0, 1, n_samples)
+            # If we have discrete points, interpolate to get the desired number of samples
+            if len(target_points) != n_samples:
+                # Simple linear interpolation for parameter values
+                original_t = jnp.linspace(0, 1, len(target_points))
+                target_points_interp = []
+                for i in range(3):  # x, y, z components
+                    target_points_interp.append(
+                        jnp.interp(t_vals, original_t, target_points[:, i])
+                    )
+                target_points = jnp.array(target_points_interp).T
         
-        # 2. Estimate number of control points that BARQ will generate
-        # Based on BARQ structure: 2 boundary + 6 gate-fixing + (n_free_points-2) internal
-        n_total_control = self.n_free_points + 6
+        # 2. Subtract initial point to fit displacement curve (as suggested in feedback)
+        target_displacement = target_points - target_points[0]
         
-        # 3. Build Bernstein matrix using existing beziertools functions
-        B_matrix = []
-        for t in t_vals:
-            row = []
-            for i in range(n_total_control):
-                # Use existing bernstein_poly function
-                bernstein_val = beziertools.bernstein_poly(
-                    jnp.array([i]), n_total_control-1, float(t)
-                )[0]
-                row.append(float(bernstein_val))
-            B_matrix.append(row)
+        # 3. Initialize default PGF and PRS parameters (outside JIT)
+        default_pgf_params = barqtools.get_default_pgf_params_dict()
+        default_prs_params = {}
         
-        B_matrix = jnp.array(B_matrix)  # Shape: (n_samples, n_total_control)
+        # 4. Create JAX-compatible curve evaluation function
+        def evaluate_curve_at_params(free_points):
+            """Evaluate BARQ curve at t_vals using vectorized operations."""
+            # Construct full parameter dictionary
+            params = {
+                'free_points': free_points,
+                'pgf_params': default_pgf_params,
+                'prs_params': default_prs_params
+            }
+            
+            # Get control points through BARQ mapping
+            control_points = self.barq_fun(params)
+            
+            # Vectorized evaluation using vmap
+            def eval_single_t(t):
+                return beziertools.bezier_curve_vec(t, control_points)
+            
+            # Use vmap for vectorized evaluation
+            curve_points = jax.vmap(eval_single_t)(t_vals)
+            
+            return curve_points
         
-        # 4. Solve least squares system using pseudo-inverse
-        control_points_fitted = jnp.linalg.pinv(B_matrix) @ target_points
+        # 5. Define the loss function (no @jax.jit decorator here)
+        def fitting_loss(free_points):
+            # Evaluate curve
+            curve_points = evaluate_curve_at_params(free_points)
+            
+            # Compute displacement from initial point
+            curve_displacement = curve_points - curve_points[0]
+            
+            # Compute mean squared error between displacements
+            mse = jnp.mean(jnp.sum((curve_displacement - target_displacement)**2, axis=1))
+            
+            return mse
         
-        # 5. Extract only the relevant points for free_points structure
-        # BARQ structure: [boundary_start, gate_fixing_points(6), internal_points, boundary_end]
-        # We want internal points that correspond to free_points[2:]
-        start_idx = 7  # After boundary_start + gate_fixing(6)
-        end_idx = start_idx + (self.n_free_points - 2)  # -2 for first two gate-fixing free points
-        
-        if end_idx > len(control_points_fitted):
-            # Fallback: use the last available points
-            fitted_internal_points = control_points_fitted[-max(1, self.n_free_points-2):]
-            if len(fitted_internal_points) < self.n_free_points - 2:
-                # Pad with normalized random points if needed
-                rng = numpy.random.default_rng(0)
-                additional_points = rng.standard_normal(
-                    (self.n_free_points - 2 - len(fitted_internal_points), 3)
-                )
-                additional_points = additional_points / numpy.linalg.norm(
-                    additional_points, axis=1, keepdims=True
-                )
-                fitted_internal_points = jnp.vstack([
-                    fitted_internal_points, 
-                    jnp.array(additional_points)
-                ])
-        else:
-            fitted_internal_points = control_points_fitted[start_idx:end_idx]
-        
-        # 6. Generate initial gate-fixing points (first 2 free_points)
-        # These will be processed by the gate-fixing algorithm
+        # 6. Initialize free_points with reasonable random values
         rng = numpy.random.default_rng(0)
-        gate_fixing_points = rng.standard_normal((2, 3))
-        gate_fixing_points = gate_fixing_points / numpy.linalg.norm(
-            gate_fixing_points, axis=1, keepdims=True
+        initial_free_points = rng.standard_normal((self.n_free_points, 3))
+        initial_free_points = initial_free_points / numpy.linalg.norm(
+            initial_free_points, axis=1, keepdims=True
         )
+        initial_free_points = jnp.array(initial_free_points)
         
-        # 7. Combine gate-fixing and fitted internal points
-        free_points = jnp.vstack([
-            jnp.array(gate_fixing_points),
-            fitted_internal_points[:self.n_free_points-2]  # Ensure correct size
-        ])
+        # 7. Optimize using simple gradient descent (more stable than optax for this case)
+        learning_rate = 0.01
+        n_iterations = 500
         
+        # JIT compile the gradient function separately
+        grad_fn = jax.jit(jax.grad(fitting_loss))
+        
+        free_points = initial_free_points
+        loss_history = []  # ← Agregar esta línea
+        
+        for i in range(n_iterations):
+            try:
+                grads = grad_fn(free_points)
+                # Simple gradient descent update
+                free_points = free_points - learning_rate * grads
+                
+                # Track losses if requested
+                if track_losses and i % 10 == 0:  # ← Agregar estas líneas
+                    current_loss = fitting_loss(free_points)
+                    loss_history.append(float(current_loss))
+                
+            except:
+                break
+        
+        # Return with optional loss history
+        if track_losses:
+            return free_points, loss_history
         return free_points
 
     def initialize_parameters(self, *, init_free_points=None,
