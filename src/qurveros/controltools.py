@@ -11,6 +11,7 @@ from qurveros.settings import settings
 
 
 def calculate_control_dict(frenet_dict, control_mode, n_points):
+
     r"""
     Calculates the control dictionary for the quantum evolution.
 
@@ -83,8 +84,9 @@ def calculate_control_dict(frenet_dict, control_mode, n_points):
     # Filter the 0 values
     singularity_idxs = singularity_idxs[singularity_idxs > 0]
 
-    sign_tracker_deriv = np.zeros_like(frenet_dict["curvature"])
-    sign_tracker_deriv[singularity_idxs] = -2 * (-1) ** np.arange(len(singularity_idxs))
+    sign_tracker_deriv = np.zeros_like(frenet_dict['curvature'])
+    sign_tracker_deriv[singularity_idxs] = \
+        -2*(-1)**np.arange(len(singularity_idxs))
     sign_tracker_deriv[0] = 1
 
     sign_tracker = np.cumsum(sign_tracker_deriv)
@@ -94,47 +96,48 @@ def calculate_control_dict(frenet_dict, control_mode, n_points):
     times = frametools.calculate_cumulative_length(frenet_dict)
 
     Tg = times[-1]
-    times = times / Tg
+    times = times/Tg
 
-    omega = Tg * sign_tracker * frenet_dict["curvature"]
+    omega = Tg*sign_tracker*frenet_dict['curvature']
 
     phi = scipy.integrate.cumulative_simpson(
-        frenet_dict["speed"] * frenet_dict["torsion"],
-        x=frenet_dict["x_values"],
-        initial=0,
-    )
+                frenet_dict['speed']*frenet_dict['torsion'],
+                x=frenet_dict['x_values'],
+                initial=0)
 
-    if control_mode == "XY":
+    if control_mode == 'XY':
         delta = np.zeros_like(omega)
 
-    elif control_mode == "XZ":
-        phi = np.zeros_like(omega)
-        delta = -Tg * frenet_dict["torsion"]
+    elif control_mode == 'XZ':
 
-    elif "TTC" in control_mode:
+        phi = np.zeros_like(omega)
+        delta = -Tg*frenet_dict['torsion']
+
+    elif 'TTC' in control_mode:
+
         # See barqtools for details.
 
-        if "pgf_params" in frenet_dict["params"]:
-            barq_angle = frenet_dict["params"]["pgf_params"]["barq_angle"][0]
-        elif "barq_angle" in frenet_dict:
-            barq_angle = frenet_dict["barq_angle"]
+        if 'pgf_params' in frenet_dict['params']:
+            barq_angle = frenet_dict['params']['pgf_params']['barq_angle'][0]
+        elif 'barq_angle' in frenet_dict:
+            barq_angle = frenet_dict['barq_angle']
         else:
-            raise ValueError(
-                "TTC requires a barq angle to calculate the detuning value."
-            )
+            raise ValueError('TTC requires a barq angle to calculate'
+                             ' the detuning value.')
 
-        delta_value = frametools.calculate_ttc_detuning(frenet_dict, barq_angle)
-        delta = delta_value * np.ones_like(omega)
+        delta_value = frametools.calculate_ttc_detuning(frenet_dict,
+                                                        barq_angle)
+        delta = delta_value*np.ones_like(omega)
 
-        phi = phi + delta * times
+        phi = phi + delta*times
 
-        if "res" in control_mode:
+        if 'res' in control_mode:
             # Enforces zero detuning while maintaining the correct value of the
             # phase field, as if the detuning was non-zero.
             delta = np.zeros_like(omega)
 
     else:
-        raise NotImplementedError("Control mode not implemented.")
+        raise NotImplementedError('Control mode not implemented.')
 
     # Boundary value of the adjoint representation.
     # The left endpoint limit does not introduce a discontinuity.
@@ -144,17 +147,16 @@ def calculate_control_dict(frenet_dict, control_mode, n_points):
     # As defined in the paper, this is an effective phase field that captures
     # the sign changes of the envelope.
 
-    gauge_angle = phi[-1] + np.pi * len(singularity_idxs)
+    gauge_angle = phi[-1] + np.pi*len(singularity_idxs)
 
-    control_dict["times"] = np.array(times)
-    control_dict["omega"] = np.array(omega)
-    control_dict["phi"] = np.array(phi)
-    control_dict["delta"] = np.array(delta)
-    control_dict["adj_curve"] = frametools.calculate_frenet_adj(
-        frenet_dict, gauge_angle
-    )
-    control_dict["tg_envelope_max"] = np.max(np.abs(omega))
-    control_dict["singularity_idxs"] = singularity_idxs
+    control_dict['times'] = np.array(times)
+    control_dict['omega'] = np.array(omega)
+    control_dict['phi'] = np.array(phi)
+    control_dict['delta'] = np.array(delta)
+    control_dict['adj_curve'] = frametools.calculate_frenet_adj(
+        frenet_dict, gauge_angle)
+    control_dict['tg_envelope_max'] = np.max(np.abs(omega))
+    control_dict['singularity_idxs'] = singularity_idxs
 
     # Interpolates the fields for uniformly spaced samples
     control_dict = interpolate_control_dict(control_dict, n_points)
@@ -163,6 +165,7 @@ def calculate_control_dict(frenet_dict, control_mode, n_points):
 
 
 def interpolate_control_dict(control_dict, n_points):
+
     """
     Interpolates the control fields for uniformly-spaced samples.
     The current interpolation scheme uses the CubicSpline method.
@@ -178,36 +181,39 @@ def interpolate_control_dict(control_dict, n_points):
 
     times_linear = np.linspace(0, 1, n_points)
 
-    for field in settings.options["FIELD_NAMES"]:
-        control_dict[field] = scipy.interpolate.CubicSpline(
-            control_dict["times"], control_dict[field]
-        )(times_linear)
+    for field in settings.options['FIELD_NAMES']:
 
-    control_dict["times"] = times_linear
+        control_dict[field] = scipy.interpolate.CubicSpline(
+                                     control_dict['times'],
+                                     control_dict[field])(times_linear)
+
+    control_dict['times'] = times_linear
 
     return control_dict
 
 
 def save_control_dict(control_dict, filename):
+
     """
     Stores the control fields in a csv or similarly formatted file.
     """
 
-    df = pd.DataFrame(
-        {key: control_dict[key] for key in ["times", *settings.options["FIELD_NAMES"]]}
-    )
+    df = pd.DataFrame({key: control_dict[key]
+                       for key in ['times', *settings.options['FIELD_NAMES']]
+                       })
 
-    df.to_csv(filename, index=False, float_format="%.12f")
+    df.to_csv(filename, index=False, float_format='%.12f')
 
 
 def load_control_dict(filename):
+
     """
     Loads the control fields from a csv file or similarly formatted file and
     returns a control dictionary.
     """
 
     load_df = pd.read_csv(filename)
-    loaded_dict = load_df.to_dict("list")
+    loaded_dict = load_df.to_dict('list')
 
     for field in loaded_dict:
         loaded_dict[field] = np.array(loaded_dict[field])
@@ -216,6 +222,7 @@ def load_control_dict(filename):
 
 
 def make_dummy_dict(n_points):
+
     """
     Creates a zero-field control dictionary for testing purposes.
     """
@@ -225,10 +232,11 @@ def make_dummy_dict(n_points):
 
     ctrl_dict = {}
 
-    for field_name in settings.options["FIELD_NAMES"]:
+    for field_name in settings.options['FIELD_NAMES']:
+
         ctrl_dict[field_name] = field
 
-    ctrl_dict["times"] = times
-    ctrl_dict["adj"] = np.eye(3)
+    ctrl_dict['times'] = times
+    ctrl_dict['adj'] = np.eye(3)
 
     return ctrl_dict

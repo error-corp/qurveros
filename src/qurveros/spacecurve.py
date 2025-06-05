@@ -12,6 +12,7 @@ from qurveros import controltools, frametools, beziertools, plottools
 
 
 class SpaceCurve:
+
     """
     Implements the SCQC to quantum evolution mapping.
 
@@ -50,7 +51,9 @@ class SpaceCurve:
         'curve', 'frame', 'curvature', 'torsion', 'deriv_array', 'length'.
     """
 
-    def __init__(self, *, curve, order, interval, params=None, deriv_array_fun=None):
+    def __init__(self, *, curve, order, interval, params=None,
+                 deriv_array_fun=None):
+
         """
         Initializes a spacecurve instance with the desired curve.
         In principle, either a curve or the tangent of a curve can be used
@@ -86,43 +89,43 @@ class SpaceCurve:
 
         # Ensure correct types for frenet_dict calculations.
         if curve is not None:
-
             def curve_fun(x, params):
-                return 1.0 * jnp.array(curve(x, params)).flatten()
+                return 1.0*jnp.array(curve(x, params)).flatten()
 
         if deriv_array_fun is None:
             if curve is None:
-                raise RuntimeError(
-                    "Either a curve or a deriv_array function must be provided."
-                )
+                raise RuntimeError('Either a curve or a deriv_array function '
+                                   'must be provided.')
 
-            deriv_array_fun = frametools.make_deriv_array_fun(curve_fun, order)
+            deriv_array_fun = frametools.make_deriv_array_fun(curve_fun,
+                                                              order)
         else:
             if curve is None and order == 0:
-                raise RuntimeError("The position vector is not defined.")
+                raise RuntimeError('The position vector is not defined.')
 
         if order > 0:
-
             def curve_fun(x, params):
-                return 0.0
+                return 0.
 
         @jax.jit
         @functools.partial(jax.vmap, in_axes=(0, None))
         def frenet_dict_fun(x, params):
+
             deriv_array = deriv_array_fun(x, params)
 
             frenet_dict = frametools.calculate_frenet_dict(deriv_array)
 
-            frenet_dict["x_values"] = x
-            frenet_dict["params"] = params
+            frenet_dict['x_values'] = x
+            frenet_dict['params'] = params
 
-            frenet_dict["curve"] = curve_fun(x, params)
+            frenet_dict['curve'] = curve_fun(x, params)
 
             return frenet_dict
 
         self._frenet_dict_fun = frenet_dict_fun
 
     def set_params(self, params):
+
         """
         Sets the default parameters of the curve.
         The associated elements are set to None so that the geometric
@@ -140,6 +143,7 @@ class SpaceCurve:
         return self.params
 
     def evaluate_frenet_dict(self, n_points=None):
+
         """
         Evaluates the frenet dictionary in a specified number of points.
 
@@ -156,19 +160,20 @@ class SpaceCurve:
         """
 
         if n_points is None:
-            n_points = settings.options["CURVE_POINTS"]
+            n_points = settings.options['CURVE_POINTS']
 
-        x_values = jnp.linspace(*self.interval, n_points)
+        x_values = jnp.linspace(*self.interval,  n_points)
 
         frenet_dict = self._frenet_dict_fun(x_values, self.params)
 
-        if len(frenet_dict["curve"].shape) < 2:
-            print("The curve will be constructed using the tangent vector.")
+        if len(frenet_dict['curve'].shape) < 2:
+
+            print('The curve will be constructed using the tangent vector.')
             curve = frametools.calculate_curve_from_tantrix(frenet_dict)
-            frenet_dict["curve"] = jnp.array(curve)
+            frenet_dict['curve'] = jnp.array(curve)
 
         speed_int = frametools.calculate_cumulative_length(frenet_dict)
-        frenet_dict["length"] = speed_int
+        frenet_dict['length'] = speed_int
 
         self.frenet_dict = frenet_dict
 
@@ -176,20 +181,23 @@ class SpaceCurve:
         return self.frenet_dict
 
     def __getitem__(self, index):
+
         dict_for_getitem = {}
 
         if self.frenet_dict is None:
             return dict_for_getitem
 
-        for key in ["curve", "frame", "curvature", "torsion", "deriv_array", "length"]:
+        for key in ['curve', 'frame', 'curvature', 'torsion',
+                    'deriv_array', 'length']:
             dict_for_getitem[key] = self.frenet_dict[key][index]
 
         return dict_for_getitem
 
     def __len__(self):
-        return len(self.frenet_dict["x_values"])
+        return len(self.frenet_dict['x_values'])
 
     def evaluate_robustness_properties(self):
+
         """
         Calculates and sets the robustness properties of the curve.
         See the RobustnessProperties class definition for more details.
@@ -200,19 +208,22 @@ class SpaceCurve:
         """
 
         if self.frenet_dict is None:
-            raise AttributeError("Have you initialized the frenet dict?")
+            raise AttributeError('Have you initialized the frenet dict?')
 
         robustness_props = RobustnessProperties(self.frenet_dict)
 
         self.robustness_props = robustness_props
 
     def get_robustness_properties(self):
+
         if self.robustness_props is None:
-            raise AttributeError("Have you evaluated the robustness properties?")
+            raise AttributeError(
+                'Have you evaluated the robustness properties?')
 
         return self.robustness_props
 
     def evaluate_control_dict(self, control_mode, n_points=None):
+
         """
         Sets the control_dict attribute. The control dictionary contains
         the control fields that implement the curve to quantum evolution
@@ -238,19 +249,22 @@ class SpaceCurve:
         """
 
         if self.frenet_dict is None:
-            raise AttributeError("Have you initialized the frenet dict?")
+            raise AttributeError('Have you initialized the frenet dict?')
 
         if n_points is None:
-            n_points = settings.options["SIM_POINTS"]
+            n_points = settings.options['SIM_POINTS']
 
         self.control_dict = controltools.calculate_control_dict(
-            self.frenet_dict, control_mode, n_points=n_points
-        )
+            self.frenet_dict,
+            control_mode,
+            n_points=n_points)
 
     def get_control_dict(self):
+
         return self.control_dict
 
     def get_gate_fidelity(self, adj_target):
+
         """
         Calculates the average gate fidelity defined in
         "A simple formula for the average gate fidelity of a
@@ -259,33 +273,37 @@ class SpaceCurve:
         """
 
         return frametools.calculate_adj_fidelity(
-            self.control_dict["adj_curve"], adj_target
-        )
+            self.control_dict['adj_curve'],
+            adj_target)
 
     def plot_position(self):
+
         """
         Plots the position vector of the curve.
         """
         if self.frenet_dict is None:
-            raise AttributeError("Have you initialized the frenet dict?")
+            raise AttributeError('Have you initialized the frenet dict?')
 
-        self._plot_vector(self.frenet_dict["curve"])
+        self._plot_vector(self.frenet_dict['curve'])
 
     def plot_tantrix(self):
+
         """
         Plots the (normalized) tangent vector of the curve.
         """
         if self.frenet_dict is None:
-            raise AttributeError("Have you initialized the frenet dict?")
+            raise AttributeError('Have you initialized the frenet dict?')
 
-        self._plot_vector(self.frenet_dict["frame"][:, 0, :])
+        self._plot_vector(self.frenet_dict['frame'][:, 0, :])
 
     def _plot_vector(self, vector):
-        Tg = self.frenet_dict["length"][-1]
 
-        plottools.plot_curve(vector, self.frenet_dict["length"] / Tg)
+        Tg = self.frenet_dict['length'][-1]
 
-    def plot_fields(self, plot_mode="full"):
+        plottools.plot_curve(vector, self.frenet_dict['length']/Tg)
+
+    def plot_fields(self, plot_mode='full'):
+
         """
         Plots the control fields depending on the plot mode.
 
@@ -294,23 +312,25 @@ class SpaceCurve:
             is not set.
         """
         if self.control_dict is None:
-            raise AttributeError("Have you chosen a control mode first?")
+            raise AttributeError('Have you chosen a control mode first?')
 
         plottools.plot_fields(self.control_dict, plot_mode)
 
     def save_control_dict(self, filename):
+
         """
         Saves the control fields in a csv file with entries described in
         the controltools.py module.
         """
 
         if self.control_dict is None:
-            raise AttributeError("Have you chosen a control mode first?")
+            raise AttributeError('Have you chosen a control mode first?')
 
         controltools.save_control_dict(self.control_dict, filename)
 
 
 class BezierCurve(SpaceCurve):
+
     """
     This class implements SCQC based on a Bezier curve, hence it
     requires only the control points.
@@ -321,6 +341,7 @@ class BezierCurve(SpaceCurve):
     """
 
     def __init__(self, points):
+
         """
         Receives the control points for the construction of the Bezier curve.
 
@@ -338,8 +359,9 @@ class BezierCurve(SpaceCurve):
         #                  interval=[0, 1],
         #                  params=points)
 
-        if points.shape[0] <= settings.options["NUM_DERIVS"]:
-            raise ValueError("More control points are required. Check NUM_DERIVS value")
+        if points.shape[0] <= settings.options['NUM_DERIVS']:
+            raise ValueError('More control points are required.'
+                             ' Check NUM_DERIVS value')
 
         bezier_deriv_array_fun = beziertools.make_bezier_deriv_array_fun()
 
@@ -347,16 +369,15 @@ class BezierCurve(SpaceCurve):
         # a sufficient number of points so that the finite differences do not
         # return an empty array.
 
-        super().__init__(
-            curve=beziertools.bezier_curve_vec,
-            order=0,
-            interval=[0, 1],
-            params=points,
-            deriv_array_fun=bezier_deriv_array_fun,
-        )
+        super().__init__(curve=beziertools.bezier_curve_vec,
+                         order=0,
+                         interval=[0, 1],
+                         params=points,
+                         deriv_array_fun=bezier_deriv_array_fun)
 
 
 class RobustnessProperties:
+
     """
     Calculates the robustness properties associated with a given curve.
 
@@ -365,21 +386,25 @@ class RobustnessProperties:
     """
 
     def __init__(self, frenet_dict):
+
         self.frenet_dict = frenet_dict
         self.calculate_properties()
 
     def __repr__(self):
+
         for rob_test, value in self.robustness_dict.items():
+
             print_val = value**2
 
-            if rob_test == "CFI":
+            if rob_test == 'CFI':
                 print_val = value
 
             print(f"|{rob_test:^25}: \t {jnp.sum(print_val):.4e}")
 
-        return ""
+        return ''
 
     def calculate_properties(self):
+
         """
         Calculates the robustness dictionary which contains all the robustness
         properties associated with the curve.
@@ -387,23 +412,22 @@ class RobustnessProperties:
 
         robustness_dict = {}
 
-        Tg = self.frenet_dict["length"][-1]
+        Tg = self.frenet_dict['length'][-1]
 
-        robustness_dict["closed_test"] = (
-            self.frenet_dict["curve"][-1] - self.frenet_dict["curve"][0]
-        ) / Tg
+        robustness_dict['closed_test'] = (self.frenet_dict['curve'][-1] -
+                                          self.frenet_dict['curve'][0])/Tg
 
-        robustness_dict["curve_area_test"] = frametools.calculate_curve_area(
-            self.frenet_dict
-        )
+        robustness_dict['curve_area_test'] = \
+            frametools.calculate_curve_area(self.frenet_dict)
 
-        robustness_dict["tantrix_area_test"] = frametools.calculate_tantrix_area(
-            self.frenet_dict
-        )
+        robustness_dict['tantrix_area_test'] = \
+            frametools.calculate_tantrix_area(self.frenet_dict)
 
-        robustness_dict["CFI"] = frametools.calculate_cfi_value(self.frenet_dict)
+        robustness_dict['CFI'] = \
+            frametools.calculate_cfi_value(self.frenet_dict)
 
         self.robustness_dict = robustness_dict
 
     def get_robustness_dict(self):
+
         return self.robustness_dict

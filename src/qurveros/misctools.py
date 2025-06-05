@@ -8,7 +8,8 @@ from qurveros import spacecurve
 import sys
 
 
-def progbar_range(num_iters, title="", depth=0):
+def progbar_range(num_iters, title='', depth=0):
+
     """
     Creates a simple progress bar depending on the depth of the nested
     iterations.
@@ -25,24 +26,25 @@ def progbar_range(num_iters, title="", depth=0):
     """
 
     if depth > 0:
-        title = "\t" * depth + " \\" + "-" * 4 + " " + title
+        title = '\t'*depth + ' \\' + '-'*4 + ' ' + title
 
-    print("\n", end="", file=sys.stderr)
+    print('\n', end='', file=sys.stderr)
 
     for step in range(num_iters):
-        percentage = 100 * step / (num_iters)
+        percentage = 100*step/(num_iters)
 
-        print(f"\r{title}:\t{percentage:^6.2f}" + "%", end="", file=sys.stderr)
+        print(f'\r{title}:\t{percentage:^6.2f}'+'%', end='', file=sys.stderr)
         yield step
 
-    print(f"\r{title}:\t{100.00:^6.2f}" + "%", end="", file=sys.stderr)
+    print(f'\r{title}:\t{100.00:^6.2f}'+'%', end='', file=sys.stderr)
     if depth > 0:
-        print("\r" + " " * 2 * len(title), end="", file=sys.stderr)
+        print('\r'+' '*2*len(title), end='', file=sys.stderr)
     else:
-        print("\n", end="", file=sys.stderr)
+        print('\n', end='', file=sys.stderr)
 
 
 def prepare_bezier_from_file(filename, *, is_barq, n_points=None):
+
     """
     Creates a BezierCurve instance from a csv file.
 
@@ -58,7 +60,7 @@ def prepare_bezier_from_file(filename, *, is_barq, n_points=None):
     """
 
     if n_points is None:
-        n_points = settings.options["CURVE_POINTS"]
+        n_points = settings.options['CURVE_POINTS']
 
     control_points = pd.read_csv(filename).to_numpy()
 

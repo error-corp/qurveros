@@ -9,6 +9,7 @@ from qurveros.settings import settings
 
 
 def simulate_control_dict(control_dict, u_target):
+
     r"""
     Simulates the control_dict that contains the fields to
     control a single-qubit Hamiltonian of the form:
@@ -36,15 +37,16 @@ def simulate_control_dict(control_dict, u_target):
     u_final = _single_qubit_sim(control_dict)[-1]
     avg_gate_fidelity = quantumtools.calculate_gate_fidelity(u_final, u_target)
 
-    sim_dict["adj_final"] = quantumtools.calculate_adj_rep(u_final)
-    sim_dict["adj_target"] = quantumtools.calculate_adj_rep(u_target)
-    sim_dict["avg_gate_fidelity"] = avg_gate_fidelity
-    sim_dict["u_final"] = u_final.full()
+    sim_dict['adj_final'] = quantumtools.calculate_adj_rep(u_final)
+    sim_dict['adj_target'] = quantumtools.calculate_adj_rep(u_target)
+    sim_dict['avg_gate_fidelity'] = avg_gate_fidelity
+    sim_dict['u_final'] = u_final.full()
 
     return sim_dict
 
 
 def _single_qubit_sim(control_dict):
+
     """
     Simulates the quantum evolution of a single qubit.
     See controltools.py for the specification of the control.
@@ -53,28 +55,24 @@ def _single_qubit_sim(control_dict):
     is the total gate time.
     """
 
-    Tg = control_dict["times"][-1]
+    Tg = control_dict['times'][-1]
 
-    Hx = qutip.sigmax() / 2
-    Hy = qutip.sigmay() / 2
-    Hz = qutip.sigmaz() / 2
+    Hx = qutip.sigmax()/2
+    Hy = qutip.sigmay()/2
+    Hz = qutip.sigmaz()/2
 
-    omega = control_dict["omega"]
-    phi = control_dict["phi"]
-    delta = control_dict["delta"]
+    omega = control_dict['omega']
+    phi = control_dict['phi']
+    delta = control_dict['delta']
 
-    x_control = Tg * omega * np.cos(phi)
-    y_control = Tg * omega * np.sin(phi)
-    z_control = Tg * delta
+    x_control = Tg*omega*np.cos(phi)
+    y_control = Tg*omega*np.sin(phi)
+    z_control = Tg*delta
 
     H_total = [[Hx, x_control], [Hy, y_control], [Hz, z_control]]
-    H_total = qutip.QobjEvo(H_total, tlist=control_dict["times"] / Tg)
+    H_total = qutip.QobjEvo(H_total, tlist=control_dict['times']/Tg)
 
-    result = qutip.propagator(
-        H_total,
-        t=control_dict["times"] / Tg,
-        args=None,
-        options=settings.options["QUTIP_OPTIONS"],
-    )
+    result = qutip.propagator(H_total, t=control_dict['times']/Tg, args=None,
+                              options=settings.options['QUTIP_OPTIONS'])
 
     return result
