@@ -9,7 +9,6 @@ from qurveros.settings import settings
 
 
 def calculate_alpha_filter_coeffs(*, alpha, n_terms, filter_type):
-
     """
     Calculates the filter coefficients for the generation of power law noise.
 
@@ -38,23 +37,20 @@ def calculate_alpha_filter_coeffs(*, alpha, n_terms, filter_type):
     bk[0] = 1
     ak[0] = 1
 
-    if filter_type == 'FIR':
-
+    if filter_type == "FIR":
         for k in range(1, n_terms):
-            c_k = (k-1 + alpha/2)/k
-            bk[k] = c_k * bk[k-1]
+            c_k = (k - 1 + alpha / 2) / k
+            bk[k] = c_k * bk[k - 1]
 
     else:
-
         for k in range(1, n_terms):
-            c_k = (k-1 - alpha/2)/k
-            ak[k] = c_k * ak[k-1]
+            c_k = (k - 1 - alpha / 2) / k
+            ak[k] = c_k * ak[k - 1]
 
     return bk, ak
 
 
 def calculate_baseline_correction(bk):
-
     """
     Calculates a correction scale that accounts for the distortions introduced
     when the FIR filter is truncated.
@@ -73,22 +69,21 @@ def calculate_baseline_correction(bk):
     see: https://dlmf.nist.gov/5.12
     """
 
-    alpha = 2*bk[1]
+    alpha = 2 * bk[1]
 
     bk_roll = np.roll(bk, -1)
-    bk_prod = bk*bk_roll
-    actual_variance = 2*(np.sum(bk**2) - np.sum(bk_prod[:-1]))
+    bk_prod = bk * bk_roll
+    actual_variance = 2 * (np.sum(bk**2) - np.sum(bk_prod[:-1]))
 
-    psd_int = 0.5*scipy.special.beta(0.5*(3-alpha), 0.5)
-    theoretical_variance = (2**(3-alpha))*psd_int/np.pi
+    psd_int = 0.5 * scipy.special.beta(0.5 * (3 - alpha), 0.5)
+    theoretical_variance = (2 ** (3 - alpha)) * psd_int / np.pi
 
-    baseline_correction = np.sqrt(theoretical_variance/actual_variance)
+    baseline_correction = np.sqrt(theoretical_variance / actual_variance)
 
     return baseline_correction
 
 
 def get_white_noise_array(*, num_realizations, n_points, rng):
-
     """
     Generates Gaussian-distributed white noise.
     """
@@ -96,9 +91,7 @@ def get_white_noise_array(*, num_realizations, n_points, rng):
     return rng.standard_normal((num_realizations, n_points))
 
 
-def get_colored_noise_array(*, num_realizations, n_points, alpha, rng,
-                            n_terms=None):
-
+def get_colored_noise_array(*, num_realizations, n_points, alpha, rng, n_terms=None):
     """
     Generates a colored noise array with prescribed PSD 1/f^alpha based on:
 
@@ -136,32 +129,29 @@ def get_colored_noise_array(*, num_realizations, n_points, alpha, rng,
     """
 
     if n_terms is None:
-        n_terms = int(settings.options['FIR_TERMS_FRACTION']*n_points)
+        n_terms = int(settings.options["FIR_TERMS_FRACTION"] * n_points)
 
     noise_mat = np.zeros((num_realizations, n_points))
-    bk, ak = calculate_alpha_filter_coeffs(alpha=alpha,
-                                           n_terms=n_terms,
-                                           filter_type='FIR')
+    bk, ak = calculate_alpha_filter_coeffs(
+        alpha=alpha, n_terms=n_terms, filter_type="FIR"
+    )
 
     white_noise_mat = get_white_noise_array(
-        num_realizations=num_realizations,
-        n_points=n_points + n_terms,
-        rng=rng)
+        num_realizations=num_realizations, n_points=n_points + n_terms, rng=rng
+    )
 
     for i in range(num_realizations):
-
         x_in = white_noise_mat[i, :]
         noise_mat[i, :] = scipy.signal.lfilter(bk, ak, x_in)[n_terms:]
 
     baseline_correction = calculate_baseline_correction(bk)
 
-    noise_mat = noise_mat*baseline_correction
+    noise_mat = noise_mat * baseline_correction
 
     return noise_mat
 
 
-def estimate_psd(sig_array, scale='log', prewhiten=False):
-
+def estimate_psd(sig_array, scale="log", prewhiten=False):
     r"""
     Estimates the PSD using the averaged periodogram method.
 
@@ -198,14 +188,14 @@ def estimate_psd(sig_array, scale='log', prewhiten=False):
 
     sig_array_fft = scipy.fft.rfft(sig_array, axis=1)
 
-    psd_est = 1/n_points*np.abs(sig_array_fft)**2
+    psd_est = 1 / n_points * np.abs(sig_array_fft) ** 2
     psd_est = np.mean(psd_est, axis=0)
 
-    ang_freqs = (2*np.pi/n_points)*np.arange(n_points)
+    ang_freqs = (2 * np.pi / n_points) * np.arange(n_points)
 
-    ang_freqs = ang_freqs[:int(n_points/2)+1]
+    ang_freqs = ang_freqs[: int(n_points / 2) + 1]
 
-    if scale == 'log':
+    if scale == "log":
         psd_est = np.log10(psd_est[1:])
         ang_freqs = np.log10(ang_freqs[1:])
 

@@ -13,7 +13,6 @@ from qurveros.settings import settings
 
 
 def make_bezier_deriv_array_fun():
-
     """
     Creates the deriv_array function for Bezier curves.
     This method sidesteps the automatic differentiation of the Bernstein
@@ -22,22 +21,20 @@ def make_bezier_deriv_array_fun():
     See also frametools.make_deriv_array_fun.
     """
 
-    NUM_DERIVS = settings.options['NUM_DERIVS']
+    NUM_DERIVS = settings.options["NUM_DERIVS"]
 
     @jax.jit
     def bezier_deriv_array_fun(x, W):
-
         deriv_list = []
         diff_coeff = W.shape[0] - 1
-        W_deriv = diff_coeff*jnp.diff(W, axis=0)
+        W_deriv = diff_coeff * jnp.diff(W, axis=0)
 
         for _ in range(NUM_DERIVS - 1):
-
             rd_vec = bezier_curve_vec(x, W_deriv)
             deriv_list.append(rd_vec)
 
             diff_coeff = W_deriv.shape[0] - 1
-            W_deriv = diff_coeff*jnp.diff(W_deriv, axis=0)
+            W_deriv = diff_coeff * jnp.diff(W_deriv, axis=0)
 
         rd_vec = bezier_curve_vec(x, W_deriv)
         deriv_list.append(rd_vec)
@@ -49,7 +46,6 @@ def make_bezier_deriv_array_fun():
 
 @jax.jit
 def bezier_curve_vec(x, W):
-
     """
     Calculates the position vector of a curve based on the Bezier ansatz.
 
@@ -72,7 +68,6 @@ def bezier_curve_vec(x, W):
 
 @jax.jit
 def bezier_adj(first_point, second_point, angle):
-
     """
     Calculates the adjoint representation of SCQC based on two control points.
 
@@ -87,10 +82,10 @@ def bezier_adj(first_point, second_point, angle):
         The adjoint representation based on the control points.
     """
 
-    tangent = first_point/frametools.vector_norm(first_point)
+    tangent = first_point / frametools.vector_norm(first_point)
 
     binormal_bar = jnp.cross(first_point, second_point)
-    binormal = binormal_bar/frametools.vector_norm(binormal_bar)
+    binormal = binormal_bar / frametools.vector_norm(binormal_bar)
 
     normal = jnp.cross(binormal, tangent)
 
@@ -98,6 +93,7 @@ def bezier_adj(first_point, second_point, angle):
     R_gauge = frametools.calculate_rot_gauge(angle)
 
     return R_gauge @ frame
+
 
 # Helper functions
 
@@ -113,7 +109,6 @@ def bernstein_poly(i, n, x):
 
 @jax.jit
 def bernstein_poly_deriv(i, n, x):
-
     """
     Calculates the derivatives of the polynomials using the properties
     of the Bernstein basis.
@@ -123,10 +118,12 @@ def bernstein_poly_deriv(i, n, x):
     by Doha et al.
     """
 
-    return n*(bernstein_poly(i-1, n-1, x) - bernstein_poly(i, n-1, x))
+    return n * (bernstein_poly(i - 1, n - 1, x) - bernstein_poly(i, n - 1, x))
 
 
 bernstein_poly.defjvps(
     # The gradients with respect to the first two arguments are not required.
-    None, None, lambda xdot, primal_out, i, n, x:
-        bernstein_poly_deriv(i, n, x)*xdot)
+    None,
+    None,
+    lambda xdot, primal_out, i, n, x: bernstein_poly_deriv(i, n, x) * xdot,
+)
