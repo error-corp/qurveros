@@ -186,6 +186,11 @@ pyproject.toml file):
 pip install ."[dependencies]"
 ```
 
+If you are looking to contribute to qurveros, clone the repo and install in editable mode:
+```
+pip install -e ."[dependencies]"
+```
+
 # Acknowledgements
 I would like to deeply thank Dennis Lucarelli, Hisham Amer and Kyle Sherbert 
 for testing qurveros and providing extremely helpful suggestions 
