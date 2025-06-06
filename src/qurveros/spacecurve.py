@@ -7,6 +7,8 @@ import jax
 import jax.numpy as jnp
 import functools
 import re
+import warnings
+import numpy as np
 
 from qurveros.settings import settings
 from qurveros import controltools, frametools, beziertools, plottools
@@ -163,7 +165,30 @@ class SpaceCurve:
         evaluated for the new set of auxiliary parameters.
         """
 
-        self.params = params
+        # Determine the correct float type based on JAX config
+        float_dtype = jnp.float64 if jax.config.jax_enable_x64 else jnp.float32
+
+        def convert_value(v):
+            """Helper function that recursively converts values to JAX-compatible floats"""
+            if isinstance(v, (jnp.ndarray, np.ndarray)):
+                if not jnp.issubdtype(v.dtype, jnp.floating):
+                    warnings.warn(f"Converting array to {float_dtype}")
+                    return jnp.asarray(v, dtype=float_dtype)
+                return v
+            elif isinstance(v, (list, tuple)):
+                return jnp.asarray(v, dtype=float_dtype)
+            elif isinstance(v, (int, float)):
+                warnings.warn(f"Converting scalar {v} to {float_dtype}")
+                return jnp.array(v, dtype=float_dtype)
+            elif isinstance(v, dict):
+                return {k: convert_value(v) for k, v in v.items()}
+            return v
+
+        # Convert all parameters while preserving the original structure
+        converted_params = {
+            k: convert_value(v) for k, v in params.items()
+        }
+        self.params = converted_params
 
         self.frenet_dict = None
         self.control_dict = None
