@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy
 import optax
 import pandas as pd
+from tqdm import tqdm
 
 from qurveros import beziertools, barqtools, spacecurve
 
@@ -46,6 +47,10 @@ class OptimizableSpaceCurve(spacecurve.SpaceCurve):
         self.opt_loss = None
         self.params_history = None
         self.loss_grad = lambda params: None
+        self.last_valid_params = None
+        self.last_valid_loss = None
+        self.is_closed = False  # Default: not closed
+        self.evaluate = lambda x, params=None: self.curve(x, params)  # Default evaluate method
 
         super().__init__(curve=curve,
                          order=order,
@@ -61,6 +66,8 @@ class OptimizableSpaceCurve(spacecurve.SpaceCurve):
 
         if init_params is not None:
             self.set_params(init_params)
+            self.last_valid_params = init_params
+            self.last_valid_loss = self.opt_loss(init_params) if self.opt_loss else None
 
     def prepare_optimization_loss(self, *loss_list, interval=None):
 
@@ -96,64 +103,381 @@ class OptimizableSpaceCurve(spacecurve.SpaceCurve):
         self.opt_loss = opt_loss
         self.loss_grad = jax.jit(jax.grad(self.opt_loss))
 
-    def optimize(self, optimizer=None, max_iter=1000):
-
+    def _validate_params(self, params):
+        """Validate parameters for numerical stability and correctness.
+        
+        Args:
+            params: Parameters to validate (can be array or dict)
+            
+        Returns:
+            tuple: (is_valid, message)
         """
-        Optimizes the curve's auxiliary parameters using Optax.
-        The parameters are updated based on the last iteration
-        of the optimizer. The params_history attribute is also set.
+        # Check if loss function is set
+        if self.opt_loss is None:
+            return False, "Loss function not set"
+        
+        try:
+            # Only check for NaN/Inf recursively, not loss/gradient
+            def check_nan_inf(p):
+                if isinstance(p, dict):
+                    for key, value in p.items():
+                        if isinstance(value, (jnp.ndarray, numpy.ndarray)):
+                            if jnp.any(jnp.isnan(value)) or jnp.any(jnp.isinf(value)):
+                                return False, f"NaN or Inf values found in {key}"
+                        elif isinstance(value, dict):
+                            is_valid, msg = check_nan_inf(value)
+                            if not is_valid:
+                                return False, f"Invalid {key}: {msg}"
+                else:
+                    if jnp.any(jnp.isnan(p)) or jnp.any(jnp.isinf(p)):
+                        return False, "NaN or Inf values found in parameters"
+                return True, "OK"
+            is_valid, msg = check_nan_inf(params)
+            if not is_valid:
+                return False, msg
+            # Only call loss/gradient on the full parameter set
+            try:
+                loss = self.opt_loss(params)
+                if jnp.isnan(loss) or jnp.isinf(loss):
+                    return False, f"Loss evaluation resulted in {loss}"
+            except Exception as e:
+                return False, f"Loss evaluation failed: {str(e)}"
+            try:
+                grad = self.loss_grad(params) if hasattr(self, 'loss_grad') and callable(self.loss_grad) else jax.grad(self.opt_loss)(params)
+                if isinstance(grad, dict):
+                    for key, value in grad.items():
+                        if isinstance(value, (jnp.ndarray, numpy.ndarray)):
+                            if jnp.any(jnp.isnan(value)) or jnp.any(jnp.isinf(value)):
+                                return False, f"NaN or Inf values in gradient for {key}"
+                else:
+                    if jnp.any(jnp.isnan(grad)) or jnp.any(jnp.isinf(grad)):
+                        return False, "NaN or Inf values in gradient"
+            except Exception as e:
+                return False, f"Gradient evaluation failed: {str(e)}"
+            # BARQ-specific checks
+            if isinstance(self, BarqCurve):
+                if 'pgf_params' in params:
+                    pgf = params['pgf_params']
+                    if not all(v > 0 for v in pgf.values() if isinstance(v, (int, float))):
+                        return False, "PGF parameters must be positive"
+                if 'free_points' in params:
+                    points = params['free_points']
+                    norms = jnp.linalg.norm(points, axis=1)
+                    if jnp.any(norms < 1e-6):
+                        return False, "Free points have zero or near-zero norms"
+            # Check boundary conditions
+            if hasattr(self, 'is_closed') and self.is_closed:
+                try:
+                    if hasattr(self, 'evaluate') and callable(self.evaluate):
+                        start = self.evaluate(0.0, params)
+                        end = self.evaluate(1.0, params)
+                        if not jnp.allclose(start, end, rtol=1e-5, atol=1e-5):
+                            return False, "Curve is not closed"
+                except Exception as e:
+                    return False, f"Boundary condition check failed: {str(e)}"
+            if hasattr(self, 'check_curvature') and self.check_curvature is not None:
+                try:
+                    if not self.check_curvature(params):
+                        return False, "Curvature check failed"
+                except Exception as e:
+                    return False, f"Curvature check failed: {str(e)}"
+            return True, "Parameters are valid"
+        except Exception as e:
+            return False, f"Validation failed: {str(e)}"
+
+    def _validate_boundary_conditions(self, params):
+        """
+        Validates boundary conditions for the curve.
+        
+        Args:
+            params: The parameters to validate
+            
+        Returns:
+            bool: True if boundary conditions are satisfied
+        """
+        try:
+            # Get curve values at boundaries
+            x_values = jnp.array([self.interval[0], self.interval[1]])
+            curve_values = self._frenet_dict_fun(x_values, params)
+            
+            # Check if curve is closed
+            if not jnp.allclose(curve_values['curve'][0], curve_values['curve'][-1], atol=1e-6):
+                return False
+                
+            # Check if curvature vanishes at boundaries
+            if not jnp.allclose(curve_values['curvature'][0], 0, atol=1e-6) or \
+               not jnp.allclose(curve_values['curvature'][-1], 0, atol=1e-6):
+                return False
+                
+            return True
+        except:
+            return False
+
+    def _perturb_params(self, params, scale=1e-4, strategy='random', error_magnitude=1.0):
+        """Perturb parameters to recover from numerical instability.
 
         Args:
-            optimizer (optax optimizer): The optimizer instance from Optax.
-            max_iter (int): The maximum number of iterations.
-
-        Raises: A RuntimeError exception is raised if the parameters
-        are not set.
-
-        Notes:
-        (1) If an optimizer is not supplied, a simple gradient descent
-            is implemented with learning_rate = 0.01.
-
-        (2) If string-based indexing is used, optimization information
-            is obtained at the optimization step which corresponds to the
-            integer value of the string or the respective slice.
+            params: Parameters to perturb
+            scale: Scale of perturbation
+            strategy: Perturbation strategy ('random', 'adaptive', 'gradient', 'trust_region', 'line_search')
+            error_magnitude: Magnitude of the error that triggered perturbation
+            
+        Returns:
+            Perturbed parameters
         """
+        if strategy == 'random':
+            if isinstance(params, dict):
+                perturbed = {}
+                for key, value in params.items():
+                    if isinstance(value, (jnp.ndarray, numpy.ndarray)):
+                        noise = jax.random.normal(jax.random.PRNGKey(0), value.shape) * scale
+                        perturbed[key] = value + noise
+                    else:
+                        perturbed[key] = value
+                return perturbed
+            else:
+                noise = jax.random.normal(jax.random.PRNGKey(0), params.shape) * scale
+                return params + noise
+            
+        elif strategy == 'adaptive':
+            # Scale perturbation based on error magnitude
+            adaptive_scale = scale / (1.0 + error_magnitude)
+            return self._perturb_params(params, scale=adaptive_scale, strategy='random')
+            
+        elif strategy == 'gradient':
+            try:
+                if isinstance(params, dict):
+                    grads = jax.grad(self.opt_loss)(params)
+                    perturbed = {}
+                    for key, value in params.items():
+                        if isinstance(value, (jnp.ndarray, numpy.ndarray)):
+                            grad = grads[key]
+                            perturbed[key] = value - scale * grad
+                        else:
+                            perturbed[key] = value
+                    return perturbed
+                else:
+                    grad = jax.grad(self.opt_loss)(params)
+                    return params - scale * grad
+            except Exception:
+                # Fall back to random perturbation if gradient computation fails
+                return self._perturb_params(params, scale=scale, strategy='random')
+            
+        elif strategy == 'trust_region':
+            try:
+                if isinstance(params, dict):
+                    grads = jax.grad(self.opt_loss)(params)
+                    hessian = jax.jacfwd(jax.grad(self.opt_loss))(params)
+                    perturbed = {}
+                    for key, value in params.items():
+                        if isinstance(value, (jnp.ndarray, numpy.ndarray)):
+                            grad = grads[key]
+                            hess = hessian[key]
+                            # Simple trust region update
+                            update = jnp.linalg.solve(hess + scale * jnp.eye(hess.shape[0]), grad)
+                            perturbed[key] = value - update
+                        else:
+                            perturbed[key] = value
+                    return perturbed
+                else:
+                    grad = jax.grad(self.opt_loss)(params)
+                    hessian = jax.jacfwd(jax.grad(self.opt_loss))(params)
+                    update = jnp.linalg.solve(hessian + scale * jnp.eye(hessian.shape[0]), grad)
+                    return params - update
+            except Exception:
+                return self._perturb_params(params, scale=scale, strategy='random')
+            
+        elif strategy == 'line_search':
+            try:
+                if isinstance(params, dict):
+                    grads = jax.grad(self.opt_loss)(params)
+                    perturbed = {}
+                    for key, value in params.items():
+                        if isinstance(value, (jnp.ndarray, numpy.ndarray)):
+                            grad = grads[key]
+                            # Backtracking line search
+                            alpha = 1.0
+                            while alpha > 1e-10:
+                                new_value = value - alpha * grad
+                                if self.opt_loss({**params, key: new_value}) < self.opt_loss(params):
+                                    perturbed[key] = new_value
+                                    break
+                                alpha *= 0.5
+                            else:
+                                perturbed[key] = value
+                        else:
+                            perturbed[key] = value
+                    return perturbed
+                else:
+                    grad = jax.grad(self.opt_loss)(params)
+                    # Backtracking line search
+                    alpha = 1.0
+                    while alpha > 1e-10:
+                        new_params = params - alpha * grad
+                        if self.opt_loss(new_params) < self.opt_loss(params):
+                            return new_params
+                        alpha *= 0.5
+                    return params
+            except Exception:
+                return self._perturb_params(params, scale=scale, strategy='random')
+            
+        else:
+            raise ValueError(f"Unknown perturbation strategy: {strategy}")
 
+    def optimize(self, optimizer=None, max_iter=1000, recovery_config=None, verbose=False):
+        """Optimize the curve's auxiliary parameters.
+        
+        Args:
+            optimizer: Optax optimizer to use (default: Adam with lr=0.01)
+            max_iter: Maximum number of optimization iterations
+            recovery_config: Configuration for recovery from numerical instability
+            verbose: Whether to print detailed progress information
+            
+        Returns:
+            dict: Optimization statistics
+        """
+        if self.params is None:
+            raise RuntimeError("Parameters not set. Call initialize_parameters() first.")
+        
+        # Default recovery configuration
+        if recovery_config is None:
+            recovery_config = {
+                'max_retries': 3,
+                'perturbation_scale': 1e-4,
+                'perturbation_strategy': 'adaptive',
+                'validation_thresholds': {
+                    'nan_threshold': 1e-10,
+                    'inf_threshold': 1e10,
+                    'gradient_threshold': 1e6,
+                    'loss_threshold': 1e10
+                }
+            }
+        
+        # Initialize optimizer
         if optimizer is None:
-            optimizer = optax.scale(-0.01)
-
+            optimizer = optax.adam(learning_rate=0.01)
+        
+        # Initialize optimization state
+        opt_state = optimizer.init(self.params)
+        best_params = self.params
+        best_loss = float('inf')
+        last_valid_params = self.params
+        last_valid_loss = float('inf')
+        
+        # Initialize statistics
+        stats = {
+            'iterations': 0,
+            'retries': 0,
+            'best_loss': float('inf'),
+            'loss_history': [],
+            'gradient_norms': [],
+            'validation_errors': [],
+            'recovery_attempts': []
+        }
+        
+        # JIT-compiled step function
         @jax.jit
         def step(params, opt_state):
-
-            grads = self.loss_grad(params)
-
+            loss_val, grads = jax.value_and_grad(self.opt_loss)(params)
             updates, opt_state = optimizer.update(grads, opt_state, params)
-
             params = optax.apply_updates(params, updates)
-
-            return params, opt_state
-
-        params = self.params
-
-        if params is None:
-            raise RuntimeError(
-                'The parameters are not set.'
-                ' Use the .initialize_parameters() for initialization.')
-
-        opt_state = optimizer.init(params)
-
-        params_history = []
-
-        for _ in progbar_range(max_iter, title='Optimizing parameters'):
-
-            params_history.append(params)
-
-            params, opt_state = step(params, opt_state)
-
-        params_history.append(params)
-        self.params_history = params_history
-
-        self.set_params(params_history[-1])
+            return params, opt_state, loss_val, grads
+        
+        # Main optimization loop
+        with tqdm(total=max_iter, desc="Optimizing") as pbar:
+            for i in range(max_iter):
+                try:
+                    # Optimization step
+                    self.params, opt_state, loss_val, grads = step(self.params, opt_state)
+                    
+                    # Update statistics
+                    stats['iterations'] = i + 1
+                    stats['loss_history'].append(float(loss_val))
+                    grad_norm = jnp.linalg.norm(jax.tree_util.tree_leaves(grads)[0])
+                    stats['gradient_norms'].append(float(grad_norm))
+                    
+                    # Validate parameters
+                    is_valid, error_msg = self._validate_params(self.params)
+                    
+                    if is_valid:
+                        # Update best parameters
+                        if loss_val < best_loss:
+                            best_loss = loss_val
+                            best_params = self.params
+                            stats['best_loss'] = float(best_loss)
+                        
+                        # Update last valid parameters
+                        last_valid_params = self.params
+                        last_valid_loss = loss_val
+                        
+                        # Update progress bar
+                        pbar.set_postfix({
+                            'loss': f"{loss_val:.2e}",
+                            'grad_norm': f"{grad_norm:.2e}"
+                        })
+                    else:
+                        # Handle invalid parameters
+                        stats['validation_errors'].append({
+                            'iteration': i,
+                            'error': error_msg,
+                            'loss': float(loss_val)
+                        })
+                        
+                        # Attempt recovery
+                        retry_count = 0
+                        while retry_count < recovery_config['max_retries']:
+                            stats['retries'] += 1
+                            stats['recovery_attempts'].append({
+                                'iteration': i,
+                                'attempt': retry_count + 1,
+                                'strategy': recovery_config['perturbation_strategy']
+                            })
+                            
+                            # Perturb parameters
+                            self.params = self._perturb_params(
+                                last_valid_params,
+                                recovery_config['perturbation_scale'],
+                                recovery_config['perturbation_strategy'],
+                                error_magnitude=loss_val - last_valid_loss
+                            )
+                            
+                            # Validate perturbed parameters
+                            is_valid, error_msg = self._validate_params(self.params)
+                            if is_valid:
+                                break
+                            
+                            retry_count += 1
+                        
+                        if retry_count >= recovery_config['max_retries']:
+                            if verbose:
+                                print(f"\nRecovery failed after {recovery_config['max_retries']} attempts")
+                                print(f"Last error: {error_msg}")
+                            # Restore best parameters
+                            self.params = best_params
+                            break
+                    
+                    pbar.update(1)
+                    
+                except Exception as e:
+                    if verbose:
+                        print(f"\nError during optimization: {str(e)}")
+                    stats['validation_errors'].append({
+                        'iteration': i,
+                        'error': str(e),
+                        'loss': float('inf')
+                    })
+                    # Restore best parameters
+                    self.params = best_params
+                    break
+        
+        # Final validation
+        is_valid, error_msg = self._validate_params(self.params)
+        if not is_valid and verbose:
+            print(f"\nFinal parameters invalid: {error_msg}")
+            print("Restoring best valid parameters")
+            self.params = best_params
+        
+        return stats
 
     def get_params_history(self):
         return self.params_history
