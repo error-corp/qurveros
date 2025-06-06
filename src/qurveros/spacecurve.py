@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import functools
 import numpy as np
 import warnings
+import re
 
 from qurveros.settings import settings
 from qurveros import controltools, frametools, beziertools, plottools
@@ -151,8 +152,6 @@ class SpaceCurve:
             elif isinstance(v,(int,float)):
                 warnings.warn(f"Converting scalar{v} to {float_dtype}")
                 return jnp.array(v, dtype=float_dtype) 
-            elif isinstance(v,dict):
-                return {k:convert_value(v) for k,v in v.items()}
             return v
         
         #Convert all parameters while preserving the original structure 

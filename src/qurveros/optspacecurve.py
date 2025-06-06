@@ -293,7 +293,7 @@ class BarqCurve(OptimizableSpaceCurve):
         """
 
         params = {}
-
+        
         if seed is None:
             seed = 0
 
@@ -316,7 +316,7 @@ class BarqCurve(OptimizableSpaceCurve):
         
         params.update({
             'free_points': init_free_points,
-            'pgf_params': init_pgf_params or barqtools_get_default_pgf_params_dict(),
+            'pgf_params': init_pgf_params or barqtools.get_default_pgf_params_dict(),
             'prs_params': init_prs_params or {}
         })
 
