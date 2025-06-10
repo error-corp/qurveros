@@ -157,14 +157,11 @@ class SpaceCurve:
         self._frenet_dict_fun = frenet_dict_fun
 
     def set_params(self, params):
-
         """
-        Sets the default parameters of the curve.
-        The associated elements are set to None so that the geometric
-        quantities, the robustness properties and the control fields are
-        evaluated for the new set of auxiliary parameters.
+        Sets the auxiliary parameters for the curve.
+        The frenet_dict, control_dict and robustness_props are reset to None
+        so that they are re-evaluated for the new set of auxiliary parameters.
         """
-
         # Determine the correct float type based on JAX config
         float_dtype = jnp.float64 if jax.config.jax_enable_x64 else jnp.float32
 
@@ -184,12 +181,16 @@ class SpaceCurve:
                 return {k: convert_value(v) for k, v in v.items()}
             return v
 
-        # Convert all parameters while preserving the original structure
-        converted_params = {
-            k: convert_value(v) for k, v in params.items()
-        }
-        self.params = converted_params
+        # Handle both dictionary and non-dictionary inputs
+        if isinstance(params, dict):
+            converted_params = {
+                k: convert_value(v) for k, v in params.items()
+            }
+        else:
+            # For non-dictionary inputs, convert the value directly
+            converted_params = convert_value(params)
 
+        self.params = converted_params
         self.frenet_dict = None
         self.control_dict = None
         self.robustness_props = None
