@@ -181,7 +181,8 @@ class SpaceCurve:
         Rz_minus_phi = jnp.array([Rz(-p) for p in phi])
 
         # Extract unadjusted frame from adjoint representation
-        frame_unadjusted = jnp.einsum('tij,tjk,kl->til', Rz_minus_phi, adj_evol, initial_rotation.T)
+        initial_rotation_inv = initial_rotation.T
+        frame_unadjusted = jnp.einsum('tij,tjk,kl->til', Rz_minus_phi, adj_evol, initial_rotation_inv)
         T = frame_unadjusted[:, 2, :]  # Tangent vector
         N = frame_unadjusted[:, 1, :]  # Normal vector
         B = -frame_unadjusted[:, 0, :]  # Binormal vector
@@ -238,7 +239,7 @@ class SpaceCurve:
         interp_frame = interp1d(times, frame, axis=0, kind='linear', fill_value="extrapolate")
         interp_curvature = interp1d(times, kappa, kind='linear', fill_value="extrapolate")
         interp_torsion = interp1d(times, tau, kind='linear', fill_value="extrapolate")
-        interp_speed = interp1d(times, precomputed_frenet_dict['speed'], kind='linear', fill_value="extrapolate")
+        interp_speed = interp1d(times, jnp.ones_like(times), kind='linear', fill_value="extrapolate")
 
         def _frenet_dict_fun(x, params):
             x = np.array(x)  # interp1d expects NumPy arrays
