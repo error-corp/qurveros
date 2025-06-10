@@ -99,26 +99,41 @@ class OptimizableSpaceCurve(spacecurve.SpaceCurve):
         self.opt_loss = opt_loss
         self.loss_grad = jax.jit(jax.grad(self.opt_loss))
 
-    def _is_params_valid(self, params):
+    def _is_params_valid(self, params, validation_keys=None):
         """
         Checks if parameters contain NaN or infinite values.
         
         Args:
             params: Parameter tree to validate
+            validation_keys: List of keys to validate. If None, validates all parameters.
             
         Returns:
-            bool: True if all parameters are finite, False otherwise
+            bool: True if specified parameters are finite, False otherwise
         """
         def is_finite_leaf(x):
             return jnp.all(jnp.isfinite(x))
         
-        # Check all leaves in the parameter tree
-        finite_flags = jax.tree_util.tree_map(is_finite_leaf, params)
-        
-        # All leaves must be finite
-        return jax.tree_util.tree_reduce(jnp.logical_and, finite_flags, True)
+        if validation_keys is None:
+            # Validate all parameters
+            finite_flags = jax.tree_util.tree_map(is_finite_leaf, params)
+            return jax.tree_util.tree_reduce(jnp.logical_and, finite_flags, True)
+        else:
+            # Validate only specified keys
+            if isinstance(params, dict):
+                for key in validation_keys:
+                    if key in params:
+                        param_subset = params[key]
+                        finite_flags = jax.tree_util.tree_map(is_finite_leaf, param_subset)
+                        is_valid = jax.tree_util.tree_reduce(jnp.logical_and, finite_flags, True)
+                        if not is_valid:
+                            return False
+                return True
+            else:
+                # For non-dict params, validate all if keys are specified
+                finite_flags = jax.tree_util.tree_map(is_finite_leaf, params)
+                return jax.tree_util.tree_reduce(jnp.logical_and, finite_flags, True)
 
-    def _create_perturbed_params(self, base_params, magnitude, rng_key):
+    def _create_perturbed_params(self, base_params, magnitude, rng_key, validation_keys=None):
         """
         Creates perturbed parameters from valid base parameters.
         
@@ -126,6 +141,7 @@ class OptimizableSpaceCurve(spacecurve.SpaceCurve):
             base_params: Valid parameter tree to perturb
             magnitude: Magnitude of perturbation
             rng_key: JAX random key
+            validation_keys: List of keys to perturb. If None, perturbs all parameters.
             
         Returns:
             Perturbed parameter tree
@@ -134,18 +150,41 @@ class OptimizableSpaceCurve(spacecurve.SpaceCurve):
             noise = jax.random.normal(key, leaf.shape) * magnitude
             return leaf + noise
         
-        # Generate keys for each leaf
-        treedef = jax.tree_util.tree_structure(base_params)
-        num_leaves = treedef.num_leaves
-        keys = jax.random.split(rng_key, num_leaves)
-        
-        # Apply noise to each leaf
-        perturbed_params = jax.tree_util.tree_map(
-            add_noise_to_leaf, base_params, 
-            jax.tree_util.tree_unflatten(treedef, keys)
-        )
-        
-        return perturbed_params
+        if validation_keys is None:
+            # Perturb all parameters
+            treedef = jax.tree_util.tree_structure(base_params)
+            num_leaves = treedef.num_leaves
+            keys = jax.random.split(rng_key, num_leaves)
+            
+            perturbed_params = jax.tree_util.tree_map(
+                add_noise_to_leaf, base_params, 
+                jax.tree_util.tree_unflatten(treedef, keys)
+            )
+            return perturbed_params
+        else:
+            # Perturb only specified keys
+            if isinstance(base_params, dict):
+                perturbed_params = dict(base_params)  # Copy base params
+                
+                for i, key in enumerate(validation_keys):
+                    if key in base_params:
+                        key_rng = jax.random.fold_in(rng_key, i)
+                        param_subset = base_params[key]
+                        
+                        treedef = jax.tree_util.tree_structure(param_subset)
+                        num_leaves = treedef.num_leaves
+                        keys = jax.random.split(key_rng, num_leaves)
+                        
+                        perturbed_subset = jax.tree_util.tree_map(
+                            add_noise_to_leaf, param_subset,
+                            jax.tree_util.tree_unflatten(treedef, keys)
+                        )
+                        perturbed_params[key] = perturbed_subset
+                        
+                return perturbed_params
+            else:
+                # For non-dict params, perturb all if keys are specified
+                return self._create_perturbed_params(base_params, magnitude, rng_key, None)
 
     def _log_retry_attempt(self, iteration, retry_count, error_type):
         """
@@ -168,7 +207,7 @@ class OptimizableSpaceCurve(spacecurve.SpaceCurve):
             logger.debug(f"Optimization retry: iter={iteration}, "
                         f"attempt={retry_count}, error={error_type}")
 
-    def optimize(self, optimizer=None, max_iter=1000):
+    def optimize(self, optimizer=None, max_iter=1000, param_validation_keys=None):
 
         """
         Optimizes the curve's auxiliary parameters using Optax.
@@ -183,6 +222,8 @@ class OptimizableSpaceCurve(spacecurve.SpaceCurve):
         Args:
             optimizer (optax optimizer): The optimizer instance from Optax.
             max_iter (int): The maximum number of iterations.
+            param_validation_keys (list): List of parameter keys to validate and perturb.
+                If None, validates all parameters. For BarqCurve, typically ['free_points'].
 
         Raises: 
             RuntimeError: If the parameters are not set.
@@ -235,7 +276,7 @@ class OptimizableSpaceCurve(spacecurve.SpaceCurve):
         rng_key = jax.random.PRNGKey(0)
         
         # Check initial parameters
-        if not self._is_params_valid(params):
+        if not self._is_params_valid(params, param_validation_keys):
             raise RuntimeError(
                 'Initial parameters contain NaN or infinite values. '
                 'Please check parameter initialization.')
@@ -248,7 +289,7 @@ class OptimizableSpaceCurve(spacecurve.SpaceCurve):
             params_history.append(params)
 
             # Periodic numerical stability check
-            if iteration % check_freq == 0 and not self._is_params_valid(params):
+            if iteration % check_freq == 0 and not self._is_params_valid(params, param_validation_keys):
                 
                 recovery_successful = False
                 
@@ -258,11 +299,11 @@ class OptimizableSpaceCurve(spacecurve.SpaceCurve):
                     # Perturb last valid parameters
                     rng_key, subkey = jax.random.split(rng_key)
                     params = self._create_perturbed_params(
-                        last_valid_params, perturbation_mag, subkey)
+                        last_valid_params, perturbation_mag, subkey, param_validation_keys)
                     opt_state = last_valid_opt_state
                     
                     # Check if perturbation resolved the issue
-                    if self._is_params_valid(params):
+                    if self._is_params_valid(params, param_validation_keys):
                         recovery_successful = True
                         if verbosity >= 1:
                             warnings.warn(
@@ -294,7 +335,7 @@ class OptimizableSpaceCurve(spacecurve.SpaceCurve):
                 new_params, new_opt_state = step(params, opt_state)
                 
                 # Validate the step result
-                if self._is_params_valid(new_params):
+                if self._is_params_valid(new_params, param_validation_keys):
                     # Successful step - update tracking variables
                     params = new_params
                     opt_state = new_opt_state
@@ -443,6 +484,23 @@ class BarqCurve(OptimizableSpaceCurve):
                          order=0,
                          interval=[0, 1],
                          deriv_array_fun=barq_derivs_fun)
+
+    def optimize(self, optimizer=None, max_iter=1000):
+        """
+        Optimizes the BARQ curve's parameters with selective validation.
+        
+        Only the free_points are validated and perturbed during numerical
+        stability recovery, preserving the gate-fixing constraints.
+        
+        Args:
+            optimizer: Optax optimizer instance
+            max_iter: Maximum number of iterations
+        """
+        return super().optimize(
+            optimizer=optimizer, 
+            max_iter=max_iter, 
+            param_validation_keys=['free_points']
+        )
 
     def _validate_curve_point(self, point, t_val):
         """
