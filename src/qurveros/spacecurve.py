@@ -181,8 +181,7 @@ class SpaceCurve:
         Rz_minus_phi = jnp.array([Rz(-p) for p in phi])
 
         # Extract unadjusted frame from adjoint representation
-        initial_rotation_inv = initial_rotation.T
-        frame_unadjusted = jnp.einsum('tij,tjk,kl->til', Rz_minus_phi, adj_evol, initial_rotation_inv)
+        frame_unadjusted = jnp.einsum('tij,tjk,kl->til', Rz_minus_phi, adj_evol, initial_rotation)
         T = frame_unadjusted[:, 2, :]  # Tangent vector
         N = frame_unadjusted[:, 1, :]  # Normal vector
         B = -frame_unadjusted[:, 0, :]  # Binormal vector
@@ -222,17 +221,6 @@ class SpaceCurve:
             curve_scaled = curve * scale_factor
             offset = original_start - curve_scaled[0]
         curve = curve * scale_factor + offset
-        # Precomputed frenet_dict for the given times
-        precomputed_frenet_dict = {
-            'x_values': times,
-            'params': None,
-            'curve': curve,
-            'frame': frame,
-            'curvature': kappa,
-            'torsion': tau,
-            'speed': jnp.ones_like(times),
-            'deriv_array': None
-        }
 
         # Define interpolation functions for flexibility in n_points
         interp_curve = interp1d(times, curve, axis=0, kind='linear', fill_value="extrapolate")
