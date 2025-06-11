@@ -8,9 +8,12 @@ import jax.numpy as jnp
 import functools
 import re
 
+from scipy.interpolate import interp1d
+from scipy.integrate import cumulative_trapezoid as cumtrapz
+import numpy as np
 from qurveros.settings import settings
 from qurveros import controltools, frametools, beziertools, plottools
-
+from qurveros.qubit_bench import simulator, quantumtools
 
 class SpaceCurve:
 
@@ -52,11 +55,10 @@ class SpaceCurve:
         'curve', 'frame', 'curvature', 'torsion', 'deriv_array', 'length'.
     """
 
-    def __init__(self, *, curve, order, interval, params=None,
-                 deriv_array_fun=None):
-
+    def __init__(self, *, curve=None, order=None, interval=None, params=None,
+             deriv_array_fun=None, control_dict=None, initial_rotation=None):
         """
-        Initializes a spacecurve instance with the desired curve.
+        Initializes a spacecurve instance with the desired curve or control pulse.
         In principle, either a curve or the tangent of a curve can be used
         to describe the mapping. The 'order' argument indicates that choice.
 
@@ -70,65 +72,65 @@ class SpaceCurve:
             interval (list): The closed interval of the curve parameter.
             params: The auxiliary parameters of the curve.
             deriv_array_fun (function): In case where the analytic derivatives
-            are pre-calculated and are given in a function that returns an
-            array of the form number_of_derivatives x 3, the automatic
-            differentiation is sidestepped in favor of the function.
-            }
+                are pre-calculated and are given in a function that returns an
+                array of the form number_of_derivatives x 3, the automatic
+                differentiation is sidestepped in favor of the function.
+            control_dict (dict): Optional control dictionary to construct the curve
+                from a pulse. If provided, curve, order, and interval are ignored.
+            initial_rotation (array): Optional initial rotation matrix for frame
+                alignment (defaults to identity).
 
         Raises:
-            RuntimeError: Raised when not sufficient information is provided
-            for the frenet dictionary to be calculated.
-            AttributeError: Raised when an attribute is referenced before
-            the corresponding quantity is calculated.
+            ValueError: If control_dict is provided with curve, order, or interval,
+                        or if control_dict is not provided and curve, order, or interval are missing.
+            RuntimeError: If neither curve nor deriv_array_fun is provided when control_dict is not used.
+            AttributeError: If an attribute is referenced before the corresponding quantity is calculated.
         """
-
         self.frenet_dict = None
         self.interval = interval
         self.params = params
         self.control_dict = None
         self.robustness_props = None
 
-        # Ensure correct types for frenet_dict calculations.
-        if curve is not None:
-            if isinstance(curve, str):
-                #Ensure characters are safe
-                if re.search(r'[^0-9A-Za-z_ \[\],\+\-\*\/\(\).]', curve):
-                    raise ValueError("Unsafe characters in curve expression")
-                
-                #Get params
-                raw_names = [m.group(1)
-                            for m in re.finditer(r'\b([A-Za-z_]\w*)\b', curve)]
-                #Find all of the math functions within jnp
-                safe_math = {
-                        name: getattr(jnp, name)
-                        for name in dir(jnp)
-                        if not name.startswith("_")
-                }
-                reserved = set(safe_math) | {'x', 'jnp'}
-                #Preserve first-seen order
-                param_names = [n for n in dict.fromkeys(raw_names) if n not in reserved]
+        if control_dict is not None:
+            if curve is not None or order is not None or interval is not None:
+                raise ValueError("When control_dict is provided, curve, order, and interval should not be specified.")
+            self._init_from_control_dict(control_dict, initial_rotation)
+            return  # Exit after initializing from control_dict
 
-                #Build the source
-                src  = "def _f(x, params):\n"
-                if param_names:
-                    src += f"    {', '.join(param_names)} = params\n"
-                src += f"    return jnp.array({curve})"
+        # Handle curve-based initialization
+        if curve is None or order is None or interval is None:
+            raise ValueError("When control_dict is not provided, curve, order, and interval must be specified.")
 
-                #Create the exec
-                safe_globals = {"__builtins__": None, "jnp": jnp, **safe_math}
-                exec(src, safe_globals)
-                curve = safe_globals['_f']
-                    
-            def curve_fun(x, params):
-                return 1.0*jnp.array(curve(x, params)).flatten()
+        if isinstance(curve, str):
+            # Ensure characters are safe
+            if re.search(r'[^0-9A-Za-z_ \[\],\+\-\*\/\(\).]', curve):
+                raise ValueError("Unsafe characters in curve expression")
+            
+            # Get params
+            raw_names = [m.group(1) for m in re.finditer(r'\b([A-Za-z_]\w*)\b', curve)]
+            safe_math = {name: getattr(jnp, name) for name in dir(jnp) if not name.startswith("_")}
+            reserved = set(safe_math) | {'x', 'jnp'}
+            param_names = [n for n in dict.fromkeys(raw_names) if n not in reserved]
+
+            # Build the source
+            src = "def _f(x, params):\n"
+            if param_names:
+                src += f"    {', '.join(param_names)} = params\n"
+            src += f"    return jnp.array({curve})"
+
+            # Create the exec
+            safe_globals = {"__builtins__": None, "jnp": jnp, **safe_math}
+            exec(src, safe_globals)
+            curve = safe_globals['_f']
+
+        def curve_fun(x, params):
+            return 1.0 * jnp.array(curve(x, params)).flatten()
 
         if deriv_array_fun is None:
             if curve is None:
-                raise RuntimeError('Either a curve or a deriv_array function '
-                                   'must be provided.')
-
-            deriv_array_fun = frametools.make_deriv_array_fun(curve_fun,
-                                                              order)
+                raise RuntimeError('Either a curve or a deriv_array function must be provided.')
+            deriv_array_fun = frametools.make_deriv_array_fun(curve_fun, order)
         else:
             if curve is None and order == 0:
                 raise RuntimeError('The position vector is not defined.')
@@ -140,19 +142,112 @@ class SpaceCurve:
         @jax.jit
         @functools.partial(jax.vmap, in_axes=(0, None))
         def frenet_dict_fun(x, params):
-
             deriv_array = deriv_array_fun(x, params)
-
             frenet_dict = frametools.calculate_frenet_dict(deriv_array)
-
             frenet_dict['x_values'] = x
             frenet_dict['params'] = params
-
             frenet_dict['curve'] = curve_fun(x, params)
-
             return frenet_dict
 
         self._frenet_dict_fun = frenet_dict_fun
+    def _init_from_control_dict(self, control_dict, initial_rotation=None):
+        """
+        Initializes the SpaceCurve from a control dictionary using the direct method.
+
+        Args:
+            control_dict (dict): Control dictionary containing 'times', 'omega', 'phi', 
+                'delta', and optionally 'original_arclength', 'original_start'.
+            initial_rotation (array): Optional initial rotation matrix (defaults to identity).
+        """
+        times = control_dict['times']
+        self.interval = [times[0], times[-1]]
+        self.params = None
+
+        if initial_rotation is None:
+            initial_rotation = jnp.eye(3)
+
+        # Simulate quantum evolution to get unitary operators
+        qu_evol = simulator._single_qubit_sim(control_dict)
+        adj_evol = jnp.array([quantumtools.calculate_adj_rep(u) for u in qu_evol])
+
+        # Compute Rz(-phi) for frame extraction
+        phi = control_dict['phi']
+        def Rz(theta):
+            return jnp.array([
+                [jnp.cos(theta), -jnp.sin(theta), 0],
+                [jnp.sin(theta), jnp.cos(theta), 0],
+                [0, 0, 1]
+            ])
+        Rz_minus_phi = jnp.array([Rz(-p) for p in phi])
+
+        # Extract unadjusted frame from adjoint representation
+        frame_unadjusted = jnp.einsum('tij,tjk,kl->til', Rz_minus_phi, adj_evol, initial_rotation)
+        T = frame_unadjusted[:, 2, :]  # Tangent vector
+        N = frame_unadjusted[:, 1, :]  # Normal vector
+        B = -frame_unadjusted[:, 0, :]  # Binormal vector
+
+        # Adjust frame based on sign of omega with sign change detection
+        omega = control_dict['omega']
+        # Detect sign changes between consecutive points
+        sign_changes = jnp.sign(omega[:-1] * omega[1:]) < 0
+        f_t = jnp.ones_like(omega)
+        # Propagate sign changes, starting with sign of first omega
+        f_t = f_t.at[0].set(jnp.sign(omega[0]) if omega[0] != 0 else 1)
+        for i in range(len(sign_changes)):
+            if sign_changes[i]:
+                f_t = f_t.at[i + 1:].set(-f_t[i + 1])
+        N_frame = f_t[:, None] * N
+        B_frame = f_t[:, None] * B
+        frame = jnp.stack([T, N_frame, B_frame], axis=1)
+
+        # Compute curvature and torsion
+        kappa = jnp.abs(omega)
+        delta = control_dict['delta']
+        dphi_dt = jnp.gradient(phi, times)
+        tau = dphi_dt - delta
+
+        # Compute curve by integrating tangent vector (unit-speed curve) with variable time steps
+        curve = cumtrapz(T, times, initial=0, axis=0)  # Shape matches times
+
+        # Adjust curve using metadata from control_dict
+        scale_factor = 1.0
+        offset = jnp.zeros(3)
+        if 'original_arclength' in control_dict and 'original_start' in control_dict:
+            original_arclength = control_dict['original_arclength']
+            original_start = control_dict['original_start']
+            # Compute total arclength of reconstructed curve
+            reconstructed_arclength = times[-1] - times[0]
+            scale_factor = original_arclength / reconstructed_arclength if reconstructed_arclength != 0 else 1.0
+            curve_scaled = curve * scale_factor
+            offset = original_start - curve_scaled[0]
+        curve = curve * scale_factor + offset
+
+        # Define interpolation functions for flexibility in n_points
+        interp_curve = interp1d(times, curve, axis=0, kind='linear', fill_value="extrapolate")
+        interp_frame = interp1d(times, frame, axis=0, kind='linear', fill_value="extrapolate")
+        interp_curvature = interp1d(times, kappa, kind='linear', fill_value="extrapolate")
+        interp_torsion = interp1d(times, tau, kind='linear', fill_value="extrapolate")
+        interp_speed = interp1d(times, jnp.ones_like(times), kind='linear', fill_value="extrapolate")
+
+        def _frenet_dict_fun(x, params):
+            x = np.array(x)  # interp1d expects NumPy arrays
+            frenet_dict = {
+                'x_values': x,
+                'params': params,
+                'curve': interp_curve(x),
+                'frame': interp_frame(x),
+                'curvature': interp_curvature(x),
+                'torsion': interp_torsion(x),
+                'speed': interp_speed(x),
+                'deriv_array': None
+            }
+            # Convert results back to JAX arrays
+            for key in frenet_dict:
+                if isinstance(frenet_dict[key], np.ndarray):
+                    frenet_dict[key] = jnp.array(frenet_dict[key])
+            return frenet_dict
+
+        self._frenet_dict_fun = _frenet_dict_fun
 
     def set_params(self, params):
 
@@ -288,6 +383,10 @@ class SpaceCurve:
             self.frenet_dict,
             control_mode,
             n_points=n_points)
+        # Add metadata to control_dict
+        if 'curve' in self.frenet_dict:
+            self.control_dict['original_arclength'] = self.frenet_dict['length'][-1]
+            self.control_dict['original_start'] = self.frenet_dict['curve'][0]
 
     def get_control_dict(self):
 
