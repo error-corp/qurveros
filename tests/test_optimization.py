@@ -1,3 +1,4 @@
+
 """
 This module contains tests for the optimization of the curves.
 """
@@ -121,7 +122,6 @@ class XgateBarqTestCase(unittest.TestCase):
 
         self.assertTrue(jnp.isclose(zero_tantrix_test, 0.))
 
-
 class NumericalStabilityTestCase(unittest.TestCase):
     """
     Tests the numerical stability handling in OptimizableSpaceCurve.optimize().
@@ -145,16 +145,16 @@ class NumericalStabilityTestCase(unittest.TestCase):
         def unstable_loss(frenet_dict):
             """
             Loss function designed to cause genuine numerical instability.
-            Uses exponential of squared parameters to force overflow -> NaN gradients.
+            Uses exponential with extreme scaling to force overflow -> NaN gradients.
             """
             params = frenet_dict['params']
-            scale = params[0]
+            scale = params[0][0]
             
             # This creates genuine numerical instability:
-            # - For large |scale|, exp(scale^2) overflows to inf
-            # - The gradient calculation then produces NaN
-            # - Based on JAX research: exp with large exponents causes real instability
-            unstable_term = jnp.exp(scale**2)
+            # - Extreme exponential growth causes gradients to overflow
+            # - The gradient calculation then produces NaN/Inf
+            # - Aggressive scaling factor ensures instability occurs quickly
+            unstable_term = jnp.exp(jnp.abs(scale) * 50.0)
             
             # Add a term that makes gradients explode when scale gets large
             gradient_exploder = 1.0 / (jnp.abs(scale) + 1e-8)
@@ -170,8 +170,12 @@ class NumericalStabilityTestCase(unittest.TestCase):
         original_verbosity = settings.options.get('OPTIMIZATION_VERBOSITY', 0)
         original_retries = settings.options.get('MAX_OPTIMIZATION_RETRIES', 3)
         original_check_freq = settings.options.get('NUMERICAL_CHECK_FREQUENCY', 1)
+        original_debug_nans = jax.config.jax_debug_nans
         
         try:
+            # Disable JAX NaN debugging to allow our recovery mechanism to work
+            jax.config.update("jax_debug_nans", False)
+            
             # Configure for aggressive testing
             settings.options['OPTIMIZATION_VERBOSITY'] = 1  # Enable warnings
             settings.options['MAX_OPTIMIZATION_RETRIES'] = 2
@@ -179,26 +183,21 @@ class NumericalStabilityTestCase(unittest.TestCase):
             settings.options['NUMERICAL_CHECK_FREQUENCY'] = 1  # Check every iteration
             
             # Initialize with a parameter that will cause instability when it grows
-            # Use aggressive learning rate to quickly reach unstable region
-            self.optspacecurve.initialize_parameters(jnp.array([5.0]))  # Start closer to instability
+            self.optspacecurve.initialize_parameters(jnp.array([0.5]))
             
             # Use aggressive optimizer to quickly reach numerical instability
-            aggressive_optimizer = optax.scale(-0.5)  # Large step size
+            aggressive_optimizer = optax.scale(-10.0)  # Very large step size
             
             # Capture warnings to verify recovery mechanism triggered
             with warnings.catch_warnings(record=True) as w:
                 warnings.simplefilter("always")
                 
-                # Use the REAL optimize method - this is key!
-                # The optimization will naturally encounter NaN/Inf due to the unstable loss
                 try:
                     self.optspacecurve.optimize(
                         optimizer=aggressive_optimizer, 
-                        max_iter=20  # Limit iterations to prevent excessive runtime
+                        max_iter=20
                     )
                 except Exception as e:
-                    # Even if optimization fails completely, that's ok for this test
-                    # We just want to verify the recovery mechanism was attempted
                     pass
                 
                 # Verify that optimization completed without crashing
@@ -206,18 +205,17 @@ class NumericalStabilityTestCase(unittest.TestCase):
                 self.assertIsNotNone(final_params)
                 
                 # Check that parameters are finite (recovery worked)
-                # If this fails, it means recovery mechanism didn't work
                 self.assertTrue(jnp.all(jnp.isfinite(final_params)), 
-                               f"Final parameters are not finite: {final_params}")
+                            f"Final parameters are not finite: {final_params}")
                 
                 # Verify that warnings were issued (indicates recovery happened)
                 warning_messages = [str(warning.message) for warning in w 
-                                  if issubclass(warning.category, RuntimeWarning)]
+                                if issubclass(warning.category, RuntimeWarning)]
                 
                 # Should have at least one warning about numerical recovery or instability
                 recovery_warnings = [msg for msg in warning_messages 
-                                   if "numerical instability" in msg.lower() or 
-                                      "recover" in msg.lower()]
+                                if "numerical instability" in msg.lower() or 
+                                    "recover" in msg.lower()]
                 
                 # If no recovery warnings, the test might not have triggered instability
                 # In that case, we force a verification by checking the loss function directly
@@ -230,23 +228,23 @@ class NumericalStabilityTestCase(unittest.TestCase):
                         grad_val = self.optspacecurve.loss_grad(test_params)
                         # If either loss or gradient is NaN/Inf, our loss function works
                         has_instability = (jnp.isnan(loss_val) or jnp.isinf(loss_val) or 
-                                         jnp.any(jnp.isnan(grad_val)) or jnp.any(jnp.isinf(grad_val)))
+                                        jnp.any(jnp.isnan(grad_val)) or jnp.any(jnp.isinf(grad_val)))
                         self.assertTrue(has_instability, 
-                                      "Loss function should produce numerical instability for large parameters")
+                                    "Loss function should produce numerical instability for large parameters")
                     except Exception:
                         # Exception during gradient computation also indicates instability
                         pass
                 else:
                     # If we got recovery warnings, the test worked as expected
                     self.assertGreater(len(recovery_warnings), 0, 
-                                     "Expected recovery warnings to be issued")
+                                    "Expected recovery warnings to be issued")
         
         finally:
             # Restore original settings
             settings.options['OPTIMIZATION_VERBOSITY'] = original_verbosity
             settings.options['MAX_OPTIMIZATION_RETRIES'] = original_retries
             settings.options['NUMERICAL_CHECK_FREQUENCY'] = original_check_freq
-
+            jax.config.update("jax_debug_nans", original_debug_nans)
     def test_parameter_validation(self):
         """Test the parameter validation functions directly"""
         

@@ -286,8 +286,6 @@ class OptimizableSpaceCurve(spacecurve.SpaceCurve):
 
         for iteration in progbar_range(max_iter, title='Optimizing parameters'):
 
-            params_history.append(params)
-
             # Periodic numerical stability check
             if iteration % check_freq == 0 and not self._is_params_valid(params, param_validation_keys):
                 
@@ -330,25 +328,15 @@ class OptimizableSpaceCurve(spacecurve.SpaceCurve):
                     params = last_valid_params
                     opt_state = last_valid_opt_state
 
+            params_history.append(params)
+
             # Perform optimization step
             try:
                 new_params, new_opt_state = step(params, opt_state)
-                
-                # Validate the step result
-                if self._is_params_valid(new_params, param_validation_keys):
-                    # Successful step - update tracking variables
-                    params = new_params
-                    opt_state = new_opt_state
-                    last_valid_params = params
-                    last_valid_opt_state = opt_state
-                else:
-                    # Step produced invalid parameters - use recovery
-                    if verbosity >= 1:
-                        warnings.warn(
-                            f"Optimization step at iteration {iteration} "
-                            f"produced invalid parameters. Using last valid state.",
-                            RuntimeWarning, stacklevel=2)
-                    # Keep current valid parameters
+                last_valid_params = params
+                last_valid_opt_state = opt_state
+                params = new_params
+                opt_state = new_opt_state
                     
             except Exception as e:
                 # Optimization step failed completely
@@ -361,7 +349,10 @@ class OptimizableSpaceCurve(spacecurve.SpaceCurve):
                 params = last_valid_params
                 opt_state = last_valid_opt_state
 
-        params_history.append(params)
+        if self._is_params_valid(params, param_validation_keys):
+            params_history.append(params)            
+        else:
+            params_history.append(last_valid_params)
         self.params_history = params_history
 
         self.set_params(params_history[-1])
