@@ -10,6 +10,8 @@ import jax.numpy as jnp
 import numpy
 import optax
 import pandas as pd
+import warnings
+import logging
 
 from qurveros import beziertools, barqtools, spacecurve
 
@@ -97,19 +99,134 @@ class OptimizableSpaceCurve(spacecurve.SpaceCurve):
         self.opt_loss = opt_loss
         self.loss_grad = jax.jit(jax.grad(self.opt_loss))
 
-    def optimize(self, optimizer=None, max_iter=1000):
+    def _is_params_valid(self, params, validation_keys=None):
+        """
+        Checks if parameters contain NaN or infinite values.
+        
+        Args:
+            params: Parameter tree to validate
+            validation_keys: List of keys to validate. If None, validates all parameters.
+            
+        Returns:
+            bool: True if specified parameters are finite, False otherwise
+        """
+        def is_finite_leaf(x):
+            return jnp.all(jnp.isfinite(x))
+        
+        if validation_keys is None:
+            # Validate all parameters
+            finite_flags = jax.tree_util.tree_map(is_finite_leaf, params)
+            return jax.tree_util.tree_reduce(jnp.logical_and, finite_flags, True)
+        else:
+            # Validate only specified keys
+            if isinstance(params, dict):
+                for key in validation_keys:
+                    if key in params:
+                        param_subset = params[key]
+                        finite_flags = jax.tree_util.tree_map(is_finite_leaf, param_subset)
+                        is_valid = jax.tree_util.tree_reduce(jnp.logical_and, finite_flags, True)
+                        if not is_valid:
+                            return False
+                return True
+            else:
+                # For non-dict params, validate all if keys are specified
+                finite_flags = jax.tree_util.tree_map(is_finite_leaf, params)
+                return jax.tree_util.tree_reduce(jnp.logical_and, finite_flags, True)
+
+    def _create_perturbed_params(self, base_params, magnitude, rng_key, validation_keys=None):
+        """
+        Creates perturbed parameters from valid base parameters.
+        
+        Args:
+            base_params: Valid parameter tree to perturb
+            magnitude: Magnitude of perturbation
+            rng_key: JAX random key
+            validation_keys: List of keys to perturb. If None, perturbs all parameters.
+            
+        Returns:
+            Perturbed parameter tree
+        """
+        def add_noise_to_leaf(leaf, key):
+            noise = jax.random.normal(key, leaf.shape) * magnitude
+            return leaf + noise
+        
+        if validation_keys is None:
+            # Perturb all parameters
+            treedef = jax.tree_util.tree_structure(base_params)
+            num_leaves = treedef.num_leaves
+            keys = jax.random.split(rng_key, num_leaves)
+            
+            perturbed_params = jax.tree_util.tree_map(
+                add_noise_to_leaf, base_params, 
+                jax.tree_util.tree_unflatten(treedef, keys)
+            )
+            return perturbed_params
+        else:
+            # Perturb only specified keys
+            if isinstance(base_params, dict):
+                perturbed_params = dict(base_params)  # Copy base params
+                
+                for i, key in enumerate(validation_keys):
+                    if key in base_params:
+                        key_rng = jax.random.fold_in(rng_key, i)
+                        param_subset = base_params[key]
+                        
+                        treedef = jax.tree_util.tree_structure(param_subset)
+                        num_leaves = treedef.num_leaves
+                        keys = jax.random.split(key_rng, num_leaves)
+                        
+                        perturbed_subset = jax.tree_util.tree_map(
+                            add_noise_to_leaf, param_subset,
+                            jax.tree_util.tree_unflatten(treedef, keys)
+                        )
+                        perturbed_params[key] = perturbed_subset
+                        
+                return perturbed_params
+            else:
+                # For non-dict params, perturb all if keys are specified
+                return self._create_perturbed_params(base_params, magnitude, rng_key, None)
+
+    def _log_retry_attempt(self, iteration, retry_count, error_type):
+        """
+        Logs retry attempts based on verbosity settings.
+        
+        Args:
+            iteration: Current optimization iteration
+            retry_count: Number of retry attempt
+            error_type: Type of numerical error detected
+        """
+        verbosity = settings.options.get('OPTIMIZATION_VERBOSITY', 0)
+        
+        if verbosity >= 1:
+            message = (f"Numerical instability detected at iteration {iteration}. "
+                      f"Retry attempt {retry_count}: {error_type}")
+            warnings.warn(message, RuntimeWarning, stacklevel=4)
+            
+        if verbosity >= 2:
+            logger = logging.getLogger(__name__)
+            logger.debug(f"Optimization retry: iter={iteration}, "
+                        f"attempt={retry_count}, error={error_type}")
+
+    def optimize(self, optimizer=None, max_iter=1000, param_validation_keys=None):
 
         """
         Optimizes the curve's auxiliary parameters using Optax.
         The parameters are updated based on the last iteration
         of the optimizer. The params_history attribute is also set.
 
+        This method includes automatic handling of numerical instabilities
+        that may occur during optimization. When NaN or infinite values
+        are detected in the parameters, the optimizer will attempt to
+        recover by perturbing the last known valid parameters and retrying.
+
         Args:
             optimizer (optax optimizer): The optimizer instance from Optax.
             max_iter (int): The maximum number of iterations.
+            param_validation_keys (list): List of parameter keys to validate and perturb.
+                If None, validates all parameters. For BarqCurve, typically ['free_points'].
 
-        Raises: A RuntimeError exception is raised if the parameters
-        are not set.
+        Raises: 
+            RuntimeError: If the parameters are not set.
 
         Notes:
         (1) If an optimizer is not supplied, a simple gradient descent
@@ -118,8 +235,20 @@ class OptimizableSpaceCurve(spacecurve.SpaceCurve):
         (2) If string-based indexing is used, optimization information
             is obtained at the optimization step which corresponds to the
             integer value of the string or the respective slice.
+            
+        (3) Numerical stability is handled automatically using settings:
+            - MAX_OPTIMIZATION_RETRIES: Maximum retry attempts (default: 3)
+            - PERTURBATION_MAGNITUDE: Size of parameter perturbation (default: 1e-6)
+            - OPTIMIZATION_VERBOSITY: Logging level (default: 0)
+            - NUMERICAL_CHECK_FREQUENCY: Check frequency (default: 1)
         """
 
+        # Load numerical stability settings
+        max_retries = settings.options.get('MAX_OPTIMIZATION_RETRIES', 3)
+        perturbation_mag = settings.options.get('PERTURBATION_MAGNITUDE', 1e-6)
+        verbosity = settings.options.get('OPTIMIZATION_VERBOSITY', 0)
+        check_freq = settings.options.get('NUMERICAL_CHECK_FREQUENCY', 1)
+        
         if optimizer is None:
             optimizer = optax.scale(-0.01)
 
@@ -141,17 +270,89 @@ class OptimizableSpaceCurve(spacecurve.SpaceCurve):
                 'The parameters are not set.'
                 ' Use the .initialize_parameters() for initialization.')
 
-        opt_state = optimizer.init(params)
+        # Initialize numerical stability tracking
+        last_valid_params = params
+        last_valid_opt_state = optimizer.init(params)
+        rng_key = jax.random.PRNGKey(0)
+        
+        # Check initial parameters
+        if not self._is_params_valid(params, param_validation_keys):
+            raise RuntimeError(
+                'Initial parameters contain NaN or infinite values. '
+                'Please check parameter initialization.')
 
+        opt_state = optimizer.init(params)
         params_history = []
 
-        for _ in progbar_range(max_iter, title='Optimizing parameters'):
+        for iteration in progbar_range(max_iter, title='Optimizing parameters'):
+
+            # Periodic numerical stability check
+            if iteration % check_freq == 0 and not self._is_params_valid(params, param_validation_keys):
+                
+                recovery_successful = False
+                
+                for retry in range(max_retries):
+                    self._log_retry_attempt(iteration, retry + 1, "NaN/Inf detected")
+                    
+                    # Perturb last valid parameters
+                    rng_key, subkey = jax.random.split(rng_key)
+                    params = self._create_perturbed_params(
+                        last_valid_params, perturbation_mag, subkey, param_validation_keys)
+                    opt_state = last_valid_opt_state
+                    
+                    # Check if perturbation resolved the issue
+                    if self._is_params_valid(params, param_validation_keys):
+                        recovery_successful = True
+                        if verbosity >= 1:
+                            warnings.warn(
+                                f"Successfully recovered from numerical instability "
+                                f"at iteration {iteration} after {retry + 1} attempts.",
+                                RuntimeWarning, stacklevel=2)
+                        break
+                
+                if not recovery_successful:
+                    # All retry attempts failed
+                    error_message = (
+                        f"Critical numerical instability at iteration {iteration}. "
+                        f"Failed to recover after {max_retries} attempts. "
+                        f"Optimization results may be unreliable. "
+                        f"Consider: (1) checking initial parameters, "
+                        f"(2) reducing learning rate, (3) using different optimizer, "
+                        f"(4) increasing PERTURBATION_MAGNITUDE in settings."
+                    )
+                    
+                    if verbosity >= 0:  # Always warn for critical failures
+                        warnings.warn(error_message, RuntimeWarning, stacklevel=2)
+                    
+                    # Continue with last valid parameters as fallback
+                    params = last_valid_params
+                    opt_state = last_valid_opt_state
 
             params_history.append(params)
 
-            params, opt_state = step(params, opt_state)
+            # Perform optimization step
+            try:
+                new_params, new_opt_state = step(params, opt_state)
+                last_valid_params = params
+                last_valid_opt_state = opt_state
+                params = new_params
+                opt_state = new_opt_state
+                    
+            except Exception as e:
+                # Optimization step failed completely
+                if verbosity >= 1:
+                    warnings.warn(
+                        f"Optimization step failed at iteration {iteration}: {e}. "
+                        f"Using last valid parameters.",
+                        RuntimeWarning, stacklevel=2)
+                # Keep current valid parameters
+                params = last_valid_params
+                opt_state = last_valid_opt_state
 
-        params_history.append(params)
+        if self._is_params_valid(params, param_validation_keys):
+            params_history.append(params)            
+        else:
+            params_history.append(last_valid_params)
         self.params_history = params_history
 
         self.set_params(params_history[-1])
@@ -274,6 +475,23 @@ class BarqCurve(OptimizableSpaceCurve):
                          order=0,
                          interval=[0, 1],
                          deriv_array_fun=barq_derivs_fun)
+
+    def optimize(self, optimizer=None, max_iter=1000):
+        """
+        Optimizes the BARQ curve's parameters with selective validation.
+        
+        Only the free_points are validated and perturbed during numerical
+        stability recovery, preserving the gate-fixing constraints.
+        
+        Args:
+            optimizer: Optax optimizer instance
+            max_iter: Maximum number of iterations
+        """
+        return super().optimize(
+            optimizer=optimizer, 
+            max_iter=max_iter, 
+            param_validation_keys=['free_points']
+        )
 
     def _validate_curve_point(self, point, t_val):
         """
